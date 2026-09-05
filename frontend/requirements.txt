@@ -1,0 +1,12 @@
+# ---------------------------------------------------------------------------
+# Streamlit UI for the IDP pipeline.
+#
+# Kept separate from the backend's requirements because this runs as its own
+# process and only talks to the API over HTTP.
+#
+#   pip install -r frontend/requirements.txt
+#   streamlit run frontend/src/app.py
+# ---------------------------------------------------------------------------
+
+streamlit==1.63.0
+requests==2.34.2

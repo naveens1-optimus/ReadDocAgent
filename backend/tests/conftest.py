@@ -93,6 +93,21 @@ def _reset_settings_cache() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _ignore_local_dotenv(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Stop the developer's own ``backend/src/.env`` reaching the tests.
+
+    ``build_settings`` calls ``load_env()``, which would read that file and
+    repopulate the very variables ``clean_env`` just removed -- making tests
+    pass or fail depending on whether the local .env happens to be filled in.
+    Neutralising the load here means settings come only from what a test sets.
+    """
+    monkeypatch.setattr(
+        "infrastructure.config.settings.load_env", lambda *args, **kwargs: None
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _offline_checkpointer(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Swap the Cosmos DB checkpointer for an in-memory SQLite one.
 

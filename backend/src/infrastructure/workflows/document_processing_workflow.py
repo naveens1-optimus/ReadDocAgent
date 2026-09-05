@@ -51,12 +51,24 @@ def build_checkpointer(settings: CosmosDbSettings) -> BaseCheckpointSaver:
     ``DefaultAzureCredential`` fallback. The database and container are
     created on first use.
     """
-    return CosmosDBSaverSync(
-        database_name=settings.database_name,
-        container_name=settings.container_name,
-        endpoint=settings.endpoint,
-        key=settings.key.get_secret_value(),
-    )
+    try:
+        return CosmosDBSaverSync(
+            database_name=settings.database_name,
+            container_name=settings.container_name,
+            endpoint=settings.endpoint,
+            key=settings.key.get_secret_value(),
+        )
+    except Exception as exc:
+        # The SDK reports "An unexpected error occurred during CosmosClient
+        # initialization", which does not say what to fix. Name the endpoint
+        # and the settings involved, and keep the underlying cause.
+        cause = exc.__cause__ or exc
+        raise RuntimeError(
+            f"Could not connect to Cosmos DB at {settings.endpoint} "
+            f"(database {settings.database_name!r}, container "
+            f"{settings.container_name!r}). Check AZURE_COSMOS_ENDPOINT and "
+            f"AZURE_COSMOS_KEY in backend/src/.env. Cause: {cause}"
+        ) from exc
 
 
 class DocumentProcessingWorkflow:
