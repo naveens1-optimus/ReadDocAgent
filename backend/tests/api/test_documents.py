@@ -12,6 +12,8 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from api.app import create_app
 from application.handler.process_document_handler import ProcessDocumentHandler
+from infrastructure.agents.data_extraction_agent import DataExtractionAgent
+from infrastructure.agents.validation_agent import ValidationAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -20,7 +22,12 @@ from infrastructure.di_container import DIContainer
 from infrastructure.workflows.document_processing_workflow import (
     DocumentProcessingWorkflow,
 )
-from tests.fakes import FakeAnalysisService, FakeBlobStorage, FakeLanguageModel
+from tests.fakes import (
+    FakeAnalysisService,
+    FakeBlobStorage,
+    FakeEntityStore,
+    FakeLanguageModel,
+)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n fake image bytes"
 
@@ -59,11 +66,13 @@ def make_harness(valid_env: dict[str, str]):
         settings = build_settings(load_dotenv_file=False)
         language_model = FakeLanguageModel(answer or CONFIDENT)
         storage = FakeBlobStorage()
+        analysis = FakeAnalysisService()
         workflow = DocumentProcessingWorkflow(
-            classifier=DocumentClassificationAgent(
-                language_model, FakeAnalysisService()
-            ),
+            classifier=DocumentClassificationAgent(language_model, analysis),
+            extractor=DataExtractionAgent(analysis, language_model),
+        validator=ValidationAgent(language_model),
             storage=storage,
+            entities=FakeEntityStore(),
             settings=settings,
             checkpointer=SqliteSaver(
                 sqlite3.connect(":memory:", check_same_thread=False)
@@ -93,27 +102,33 @@ def upload(client: TestClient, name: str = "invoice.png", data: bytes = PNG_BYTE
 
 
 class TestUpload:
-    def test_confident_document_completes_immediately(self, make_harness) -> None:
+    def test_confident_document_runs_on_to_extraction_review(
+        self, make_harness
+    ) -> None:
+        """Confidence skips the classification gate, never the extraction one."""
         harness = make_harness(CONFIDENT)
 
         response = upload(harness.client)
 
         assert response.status_code == 200
         body = response.json()
-        assert body["status"] == "completed"
         assert body["document_type"] == "invoice"
         assert body["confidence"] == pytest.approx(0.94)
-        assert body["awaiting_approval"] is False
         assert body["document_id"]
+        # Auto-approved the classification, then paused on the data.
+        assert body["status"] == "awaiting_extraction_review"
+        assert body["awaiting_approval"] is True
+        assert body["approval_request"]["stage"] == "extraction"
 
-    def test_stores_the_input_document_and_the_result(self, make_harness) -> None:
+    def test_stores_the_input_document(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
 
         upload(harness.client)
 
         containers = [item["container"] for item in harness.storage.uploads]
         assert "idp-input" in containers
-        assert "idp-output" in containers
+        # Nothing saved yet: the reviewer has not signed off the data.
+        assert "idp-output" not in containers
 
     def test_response_omits_internals(self, make_harness) -> None:
         """Blob URLs and the audit trail stay server-side.
@@ -195,10 +210,9 @@ class TestApprovalCheckpoint:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["status"] == "completed"
-        assert body["awaiting_approval"] is False
-        # The save still happened, it is just not echoed back.
-        assert "idp-output" in [i["container"] for i in harness.storage.uploads]
+        # Approving the classification advances to the extraction gate.
+        assert body["status"] == "awaiting_extraction_review"
+        assert body["approval_request"]["stage"] == "extraction"
 
     def test_rejecting_marks_the_run_rejected(self, make_harness) -> None:
         harness = make_harness(UNSURE)
@@ -221,7 +235,8 @@ class TestApprovalCheckpoint:
         ).json()
 
         assert body["document_type"] == "receipt"
-        assert body["status"] == "completed"
+        # The correction picks the extraction model: receipt, not invoice.
+        assert body["extraction_model"] == "prebuilt-receipt"
 
     def test_unknown_document_returns_404(self, make_harness) -> None:
         harness = make_harness()
@@ -245,9 +260,22 @@ class TestApprovalCheckpoint:
 
 
 class TestStatus:
+    def test_reports_a_run_paused_on_its_data(self, make_harness) -> None:
+        harness = make_harness(CONFIDENT)
+        document_id = upload(harness.client).json()["document_id"]
+
+        body = harness.client.get(f"/documents/{document_id}").json()
+
+        assert body["status"] == "awaiting_extraction_review"
+        assert body["document_type"] == "invoice"
+        assert body["approval_request"]["stage"] == "extraction"
+
     def test_reports_a_completed_run(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
         document_id = upload(harness.client).json()["document_id"]
+        harness.client.post(
+            f"/documents/{document_id}/approval", json={"approved": True}
+        )
 
         body = harness.client.get(f"/documents/{document_id}").json()
 
@@ -302,7 +330,7 @@ class TestDocumentsAreIndependent:
         done = harness.client.post(
             f"/documents/{first['document_id']}/approval", json={"approved": True}
         ).json()
-        assert done["status"] == "completed"
+        assert done["status"] == "awaiting_extraction_review"
 
         other = harness.client.get(f"/documents/{second['document_id']}").json()
         assert other["status"] == "awaiting_approval"

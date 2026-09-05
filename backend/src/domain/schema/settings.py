@@ -187,9 +187,13 @@ class CosmosDbSettings(_StrictModel):
     database_name: str = Field(default="idp_langgraph")
     container_name: str = Field(default="checkpoints")
 
+    #: Validated business entities live in their own container, apart from
+    #: LangGraph's checkpoint plumbing.
+    entity_container: str = Field(default="entities")
+
     _normalise = field_validator("endpoint")(_normalise_endpoint)
 
-    @field_validator("database_name", "container_name")
+    @field_validator("database_name", "container_name", "entity_container")
     @classmethod
     def _require_name(cls, value: str) -> str:
         if not value.strip():
@@ -328,5 +332,7 @@ class Settings(_StrictModel):
                 f"{self.retry.max_delay_seconds}s",
                 f"checkpointer         : cosmos {self.cosmos_db.endpoint} "
                 f"({self.cosmos_db.database_name}/{self.cosmos_db.container_name})",
+                f"entity store         : {self.cosmos_db.database_name}/"
+                f"{self.cosmos_db.entity_container}",
             )
         )

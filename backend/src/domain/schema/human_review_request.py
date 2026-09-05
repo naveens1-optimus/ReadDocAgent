@@ -19,6 +19,18 @@ class HumanReviewRequest(BaseModel):
         default=None,
         description="Set to correct the classifier's answer while approving.",
     )
+    #: The finalised JSON, sent at the extraction review step. Whatever is
+    #: here is what gets saved -- the reviewer may change values, drop fields
+    #: or add new ones. Omitted at the classification step.
+    fields: dict[str, Any] | None = Field(
+        default=None, description="Finalised {field: value} JSON."
+    )
+
+    #: At the field-completion gate: continue even though required fields are
+    #: still missing. Without it a reviewer who cannot supply a value would be
+    #: asked the same question forever.
+    skip: bool = Field(default=False)
+
     reviewer: str | None = Field(default=None, max_length=256)
     note: str | None = Field(default=None, max_length=2000)
 
@@ -33,6 +45,8 @@ class HumanReviewRequest(BaseModel):
             "document_type": (
                 self.document_type.value if self.document_type else None
             ),
+            "fields": self.fields,
+            "skip": self.skip,
             "reviewer": self.reviewer,
             "note": self.note,
         }

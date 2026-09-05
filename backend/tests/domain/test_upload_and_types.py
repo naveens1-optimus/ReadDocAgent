@@ -97,6 +97,8 @@ class TestHumanReviewRequest:
         assert review.to_resume_payload() == {
             "approved": True,
             "document_type": "receipt",
+            "fields": None,
+            "skip": False,
             "reviewer": "naveen",
             "note": "corrected",
         }

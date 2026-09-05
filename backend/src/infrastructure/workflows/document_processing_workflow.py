@@ -1,21 +1,42 @@
-"""The LangGraph pipeline.
+"""The LangGraph pipeline -- four agents, three human checkpoints.
 
-    START -> classify -> human_approval -> save -> END
-                 |
-                 +-----> error_handler -> END
+    classify -> human_approval -> extract -> extraction_review -> validate
+                                                                     |
+                        +--> complete_fields <--(missing required)---+
+                        |          |                                 |
+                        +----------+                          (complete)
+                                                                     |
+                                            save <-- enrich <--------+
 
-``classify`` asks the classifier agent what the document is. ``human_approval``
-is the human-in-the-loop checkpoint: it pauses the graph with ``interrupt()``
-when the classifier is not confident enough, and resumes when a reviewer
-answers. ``save`` writes the result to Blob Storage.
+Agents:
 
-Extraction becomes a fourth node after ``human_approval``, once the approved
-document type is known.
+1. ``classify``            what the document is (Azure OpenAI vision).
+2. ``extract``             its fields (the Document Intelligence model for
+                           that type).
+3. ``validate`` + ``enrich``  checks the data against the entity schema, then
+                           standardises and summarises it with Azure OpenAI.
+4. ``save``                stores the entity, the output and the report.
+
+Human checkpoints, each gating something different:
+
+* ``human_approval``    confirms *what the document is*. Auto-approves a
+                        confident, recognised classification, so a reviewer is
+                        only interrupted when the answer is doubtful.
+* ``extraction_review`` confirms *the data*. Always pauses -- the reviewer is
+                        signing off the values that get saved, and may edit
+                        them first.
+* ``complete_fields``   asks only when the schema requires a field the
+                        extraction could not supply. It loops back through
+                        validation, so supplied values are checked like any
+                        others.
+
+A failure in any node routes to ``error_handler``.
 """
 
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 from langchain_azure_cosmosdb import CosmosDBSaverSync
@@ -24,15 +45,23 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from application.interface.blob_storage_service import IBlobStorageService
+from application.interface.entity_store import IEntityStore
 from domain.entity.audit_entry import AuditEntry
+from domain.entity.processing_report import ProcessingReport
 from domain.enum.document_type import DocumentType
 from domain.enum.processing_status import AgentName, ProcessingStatus
 from domain.schema.settings import CosmosDbSettings, Settings
+from infrastructure.agents.data_extraction_agent import DataExtractionAgent
+from infrastructure.agents.validation_agent import ValidationAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
 from infrastructure.utilities.logging_config import get_logger
-from infrastructure.workflows.state import ApprovalDecision, DocumentState
+from infrastructure.workflows.state import (
+    ApprovalDecision,
+    DocumentState,
+    ExtractionReview,
+)
 
 __all__ = ["DocumentProcessingWorkflow", "build_checkpointer"]
 
@@ -77,12 +106,18 @@ class DocumentProcessingWorkflow:
     def __init__(
         self,
         classifier: DocumentClassificationAgent,
+        extractor: DataExtractionAgent,
+        validator: ValidationAgent,
         storage: IBlobStorageService,
+        entities: IEntityStore,
         settings: Settings,
         checkpointer: BaseCheckpointSaver,
     ) -> None:
         self._classifier = classifier
+        self._extractor = extractor
+        self._validator = validator
         self._storage = storage
+        self._entities = entities
         self._settings = settings
         self.graph = self._build(checkpointer)
 
@@ -91,6 +126,8 @@ class DocumentProcessingWorkflow:
 
         builder.add_node(AgentName.CLASSIFIER.value, self._classify)
         builder.add_node(AgentName.HUMAN_APPROVAL.value, self._human_approval)
+        builder.add_node(AgentName.EXTRACTOR.value, self._extract)
+        builder.add_node(AgentName.EXTRACTION_REVIEW.value, self._extraction_review)
         builder.add_node(AgentName.SAVE.value, self._save)
         builder.add_node(AgentName.ERROR_HANDLER.value, self._handle_error)
 
@@ -103,7 +140,46 @@ class DocumentProcessingWorkflow:
                 "error": AgentName.ERROR_HANDLER.value,
             },
         )
-        builder.add_edge(AgentName.HUMAN_APPROVAL.value, AgentName.SAVE.value)
+        builder.add_conditional_edges(
+            AgentName.HUMAN_APPROVAL.value,
+            self._route_after_approval,
+            {
+                "extract": AgentName.EXTRACTOR.value,
+                "save": AgentName.SAVE.value,
+            },
+        )
+        builder.add_conditional_edges(
+            AgentName.EXTRACTOR.value,
+            self._route_after_extract,
+            {
+                "review": AgentName.EXTRACTION_REVIEW.value,
+                "error": AgentName.ERROR_HANDLER.value,
+            },
+        )
+        builder.add_node(AgentName.VALIDATOR.value, self._validate)
+        builder.add_node(AgentName.FIELD_COMPLETION.value, self._complete_fields)
+        builder.add_node(AgentName.ENRICHER.value, self._enrich)
+
+        builder.add_conditional_edges(
+            AgentName.EXTRACTION_REVIEW.value,
+            self._route_after_extraction_review,
+            {
+                "validate": AgentName.VALIDATOR.value,
+                "save": AgentName.SAVE.value,
+            },
+        )
+        builder.add_conditional_edges(
+            AgentName.VALIDATOR.value,
+            self._route_after_validate,
+            {
+                "complete": AgentName.FIELD_COMPLETION.value,
+                "enrich": AgentName.ENRICHER.value,
+            },
+        )
+        # Back to validation, so the values a reviewer supplied are checked
+        # like any others rather than trusted blindly.
+        builder.add_edge(AgentName.FIELD_COMPLETION.value, AgentName.VALIDATOR.value)
+        builder.add_edge(AgentName.ENRICHER.value, AgentName.SAVE.value)
         builder.add_edge(AgentName.SAVE.value, END)
         builder.add_edge(AgentName.ERROR_HANDLER.value, END)
 
@@ -183,6 +259,7 @@ class DocumentProcessingWorkflow:
         )
         answer = interrupt(
             {
+                "stage": "classification",
                 "question": "Is this classification correct?",
                 "document_id": state.document_id,
                 "file_name": state.file_name,
@@ -241,31 +318,336 @@ class DocumentProcessingWorkflow:
         ]
         return update
 
+    def _extract(self, state: DocumentState) -> dict[str, Any]:
+        """Extract fields with the prebuilt model for the approved type.
+
+        Re-reads the document from Blob Storage rather than carrying its bytes
+        through the graph, so the checkpoint written while waiting for
+        approval stays small.
+        """
+        assert state.classification is not None  # guaranteed by the routing
+        document_type = state.classification.document_type
+
+        try:
+            data = self._storage.download(
+                self._settings.blob_storage.input_container,
+                state.input_blob_name or "",
+            )
+            result = self._extractor.extract(document_type, data)
+        except Exception as exc:  # noqa: BLE001 - routed to the error node
+            logger.exception("Extraction failed for %s", state.document_id)
+            return {
+                "error": str(exc),
+                "status": ProcessingStatus.FAILED,
+                "audit_trail": [
+                    AuditEntry.failure(AgentName.EXTRACTOR, "extract", exc)
+                ],
+            }
+
+        return {
+            "extraction": result,
+            "status": ProcessingStatus.EXTRACTED,
+            "audit_trail": [
+                AuditEntry.record(
+                    AgentName.EXTRACTOR,
+                    "extract",
+                    model_id=result.model_id,
+                    field_count=len(result.fields),
+                )
+            ],
+        }
+
+    def _extraction_review(self, state: DocumentState) -> dict[str, Any]:
+        """Human-in-the-loop checkpoint for the extracted fields.
+
+        Always pauses -- unlike the classification gate there is no confidence
+        shortcut, because the reviewer is signing off the data itself. The
+        JSON they send back is what gets saved.
+        """
+        extraction = state.extraction
+        assert extraction is not None  # guaranteed by the routing edge
+
+        answer = interrupt(
+            {
+                "stage": "extraction",
+                "document_id": state.document_id,
+                "file_name": state.file_name,
+                "document_type": (
+                    state.classification.document_type.value
+                    if state.classification
+                    else None
+                ),
+                "model_id": extraction.model_id,
+                # Per-field confidence, so the reviewer can see which values
+                # to check most closely.
+                "fields": [field.model_dump(mode="json") for field in extraction.fields],
+                # The editable JSON.
+                "json": extraction.to_json(),
+            }
+        )
+
+        answer = answer or {}
+        edited = answer.get("fields")
+        final = (
+            extraction.apply_edits(edited)
+            if isinstance(edited, dict)
+            else extraction
+        )
+        approved = bool(answer.get("approved", False))
+
+        review = ExtractionReview(
+            approved=approved,
+            reviewer=answer.get("reviewer"),
+            note=answer.get("note"),
+            edited_fields=final.edited_field_names,
+        )
+        logger.info(
+            "Extraction %s by %s (%s field(s) edited)",
+            "approved" if approved else "rejected",
+            review.reviewer or "unknown",
+            len(review.edited_fields),
+        )
+        return {
+            "extraction": final,
+            "extraction_review": review,
+            "status": (
+                ProcessingStatus.APPROVED if approved else ProcessingStatus.REJECTED
+            ),
+            "audit_trail": [
+                AuditEntry.record(
+                    AgentName.EXTRACTION_REVIEW,
+                    "review_extraction",
+                    approved=approved,
+                    reviewer=review.reviewer,
+                    edited_fields=review.edited_fields,
+                )
+            ],
+        }
+
+    def _validate(self, state: DocumentState) -> dict[str, Any]:
+        """Check the approved data against the entity schema for its type."""
+        assert state.classification is not None
+        assert state.extraction is not None
+
+        # Anything a reviewer filled in earlier takes part in validation.
+        data = {**state.extraction.to_json(), **state.completed_fields}
+        confidences = {
+            field.name: field.confidence for field in state.extraction.fields
+        }
+
+        try:
+            result = self._validator.validate(
+                document_type=state.classification.document_type,
+                data=data,
+                confidences=confidences,
+                confidence_threshold=self._settings.app.confidence_threshold,
+                arithmetic_tolerance=Decimal(
+                    str(self._settings.app.arithmetic_tolerance)
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - routed to the error node
+            logger.exception("Validation failed for %s", state.document_id)
+            return {
+                "error": str(exc),
+                "status": ProcessingStatus.FAILED,
+                "audit_trail": [
+                    AuditEntry.failure(AgentName.VALIDATOR, "validate", exc)
+                ],
+            }
+
+        return {
+            "validation": result,
+            "status": ProcessingStatus.VALIDATED,
+            "audit_trail": [
+                AuditEntry.record(
+                    AgentName.VALIDATOR,
+                    "validate",
+                    passed=result.passed,
+                    missing_fields=result.missing_fields,
+                    low_confidence=result.low_confidence_fields,
+                )
+            ],
+        }
+
+    def _complete_fields(self, state: DocumentState) -> dict[str, Any]:
+        """Ask a reviewer to supply the required fields extraction missed."""
+        validation = state.validation
+        assert validation is not None
+
+        answer = interrupt(
+            {
+                "stage": "field_completion",
+                "document_id": state.document_id,
+                "file_name": state.file_name,
+                "document_type": (
+                    state.classification.document_type.value
+                    if state.classification
+                    else None
+                ),
+                "missing_fields": validation.missing_fields,
+                "low_confidence_fields": validation.low_confidence_fields,
+                "failed_checks": [
+                    check.message for check in validation.failed_checks
+                ],
+                # The data as it stands, so the reviewer has context.
+                "current": (
+                    state.extraction.to_json() if state.extraction else {}
+                ),
+            }
+        )
+
+        answer = answer or {}
+        supplied = answer.get("fields") or {}
+        skip = bool(answer.get("skip"))
+
+        logger.info(
+            "Reviewer supplied %s field(s)%s",
+            len(supplied),
+            " and chose to continue regardless" if skip else "",
+        )
+        return {
+            "completed_fields": {**state.completed_fields, **supplied},
+            "skip_completion": skip,
+            "audit_trail": [
+                AuditEntry.record(
+                    AgentName.FIELD_COMPLETION,
+                    "complete_fields",
+                    supplied=sorted(supplied),
+                    reviewer=answer.get("reviewer"),
+                    skipped=skip,
+                )
+            ],
+        }
+
+    def _enrich(self, state: DocumentState) -> dict[str, Any]:
+        """Standardise and summarise the validated data with Azure OpenAI."""
+        validation = state.validation
+        assert validation is not None
+        assert state.classification is not None
+
+        data = validation.entity or {
+            **(state.extraction.to_json() if state.extraction else {}),
+            **state.completed_fields,
+        }
+        summary, enriched, error = self._validator.enrich(
+            state.classification.document_type, data
+        )
+
+        updated = validation.model_copy(
+            update={
+                "summary": summary,
+                "enriched_fields": enriched,
+                "enrichment_error": error,
+                "entity": {**data, **enriched} if validation.entity else None,
+            }
+        )
+        return {
+            "validation": updated,
+            "audit_trail": [
+                AuditEntry.record(
+                    AgentName.ENRICHER,
+                    "enrich",
+                    enriched=sorted(enriched),
+                    summary_generated=summary is not None,
+                    error=error,
+                )
+            ],
+        }
+
     def _save(self, state: DocumentState) -> dict[str, Any]:
-        """Write the classification result to Blob Storage."""
+        """Agent 4: store the entity, the output and the processing report.
+
+        Persisting happens here rather than earlier so nothing is written
+        until the run has actually been signed off.
+        """
+        # Both gates must pass. A reviewer who rejects the extracted data
+        # rejects the run, even though the classification was approved
+        # earlier to get there.
+        approved = state.approval is not None and state.approval.approved
+        if state.extraction_review is not None:
+            approved = approved and state.extraction_review.approved
+
+        entity_id: str | None = None
+        validation = state.validation
+
+        # The validated entity goes to Cosmos, keyed on the document id.
+        # Only for an approved run with a complete entity -- there is no point
+        # storing business data a reviewer rejected.
+        if approved and validation is not None and validation.entity is not None:
+            try:
+                entity_id = self._entities.save(
+                    document_id=state.document_id,
+                    document_type=(
+                        state.classification.document_type.value
+                        if state.classification
+                        else "unknown"
+                    ),
+                    entity=validation.entity,
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded, run still ends
+                logger.exception("Failed to store entity for %s", state.document_id)
+                return {
+                    "error": str(exc),
+                    "status": ProcessingStatus.FAILED,
+                    "audit_trail": [
+                        AuditEntry.failure(AgentName.SAVE, "store_entity", exc)
+                    ],
+                }
+
+        report = ProcessingReport.build(
+            document_id=state.document_id,
+            file_name=state.file_name,
+            status=(
+                ProcessingStatus.COMPLETED.value
+                if approved
+                else ProcessingStatus.REJECTED.value
+            ),
+            classification=state.classification,
+            extraction=state.extraction,
+            validation=validation,
+            confidence_threshold=self._settings.app.confidence_threshold,
+            reviewers=_reviewers(state),
+            approval_reviewer=(
+                state.approval.reviewer if state.approval else None
+            ),
+            corrected_type=bool(
+                state.approval and state.approval.corrected_document_type
+            ),
+            entity_id=entity_id,
+            error=state.error,
+        )
+
         payload = {
             "document_id": state.document_id,
             "file_name": state.file_name,
             "input_blob_url": state.input_blob_url,
-            "classification": (
-                state.classification.model_dump(mode="json")
-                if state.classification
-                else None
+            # The final, validated and enriched entity -- what consumers read.
+            "entity": validation.entity if validation else None,
+            "summary": validation.summary if validation else None,
+            # The same fields with their per-field confidence and spatial
+            # data, so the output records how the values were arrived at.
+            "extraction": (
+                state.extraction.model_dump(mode="json") if state.extraction else None
             ),
-            "approval": (
-                state.approval.model_dump(mode="json") if state.approval else None
-            ),
+            "report": report.model_dump(mode="json"),
             "audit_trail": [
                 entry.model_dump(mode="json") for entry in state.audit_trail
             ],
         }
-        data = json.dumps(payload, indent=2).encode("utf-8")
 
         try:
             url = self._storage.upload(
                 container=self._settings.blob_storage.output_container,
-                blob_name=f"{state.document_id}/classification.json",
-                data=data,
+                blob_name=f"{state.document_id}/result.json",
+                data=json.dumps(payload, indent=2, default=str).encode("utf-8"),
+                content_type="application/json",
+            )
+            self._storage.upload(
+                container=self._settings.blob_storage.output_container,
+                blob_name=f"{state.document_id}/report.json",
+                data=json.dumps(
+                    report.model_dump(mode="json"), indent=2, default=str
+                ).encode("utf-8"),
                 content_type="application/json",
             )
         except Exception as exc:  # noqa: BLE001 - recorded, run still ends
@@ -276,14 +658,19 @@ class DocumentProcessingWorkflow:
                 "audit_trail": [AuditEntry.failure(AgentName.SAVE, "save", exc)],
             }
 
-        approved = state.approval is not None and state.approval.approved
         return {
             "output_blob_url": url,
+            "entity_id": entity_id,
             "status": (
                 ProcessingStatus.COMPLETED if approved else ProcessingStatus.REJECTED
             ),
             "audit_trail": [
-                AuditEntry.record(AgentName.SAVE, "save", output_blob_url=url)
+                AuditEntry.record(
+                    AgentName.SAVE,
+                    "save",
+                    output_blob_url=url,
+                    entity_id=entity_id,
+                )
             ],
         }
 
@@ -312,3 +699,60 @@ class DocumentProcessingWorkflow:
         if state.error or state.classification is None:
             return "error"
         return "approval"
+
+    @staticmethod
+    def _route_after_approval(state: DocumentState) -> str:
+        """Extract only when an approved type has a model for it.
+
+        A rejected document, or an approved type with no extraction path yet,
+        goes straight to save so the outcome is still recorded.
+        """
+        approved = state.approval is not None and state.approval.approved
+        if not approved or state.classification is None:
+            return "save"
+        return (
+            "extract" if state.classification.document_type.is_extractable else "save"
+        )
+
+    @staticmethod
+    def _route_after_extract(state: DocumentState) -> str:
+        """Send failed extractions to the error node."""
+        if state.error or state.extraction is None:
+            return "error"
+        return "review"
+
+    @staticmethod
+    def _route_after_extraction_review(state: DocumentState) -> str:
+        """Validate approved data; a rejected run goes straight to save."""
+        review = state.extraction_review
+        if review is None or not review.approved:
+            return "save"
+        return "validate"
+
+    @staticmethod
+    def _route_after_validate(state: DocumentState) -> str:
+        """Ask a human for anything required that is still missing.
+
+        The reviewer can also choose to continue regardless, which sets
+        ``skip_completion`` -- without it the graph would ask, be answered
+        incompletely, and ask again forever.
+        """
+        validation = state.validation
+        if validation is None or state.error:
+            return "enrich"
+        if validation.missing_fields and not state.skip_completion:
+            return "complete"
+        return "enrich"
+
+
+def _reviewers(state: DocumentState) -> list[str]:
+    """Everyone who took part in reviewing this run, in order, de-duplicated."""
+    names = [
+        state.approval.reviewer if state.approval else None,
+        state.extraction_review.reviewer if state.extraction_review else None,
+    ]
+    seen: list[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.append(name)
+    return seen

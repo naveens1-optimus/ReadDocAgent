@@ -12,7 +12,28 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
 
-__all__ = ["DocumentType"]
+__all__ = ["DocumentType", "PrebuiltModel", "EXTRACTION_MODEL_BY_TYPE"]
+
+
+class PrebuiltModel(str, Enum):
+    """Azure Document Intelligence prebuilt model ids."""
+
+    INVOICE = "prebuilt-invoice"
+    RECEIPT = "prebuilt-receipt"
+    #: Text plus tables and spatial structure; used for contracts.
+    LAYOUT = "prebuilt-layout"
+    #: Text only, the cheapest model; used for resumes.
+    READ = "prebuilt-read"
+
+    @property
+    def returns_typed_fields(self) -> bool:
+        """Whether the model returns named fields with confidence scores.
+
+        Only the document-specific models do. Layout and read return text,
+        which Azure OpenAI then has to structure -- and that path has no
+        per-field confidence to report.
+        """
+        return self in {PrebuiltModel.INVOICE, PrebuiltModel.RECEIPT}
 
 
 class DocumentType(str, Enum):
@@ -29,6 +50,20 @@ class DocumentType(str, Enum):
     def description(self) -> str:
         """One-line definition, used to tell the model what this type means."""
         return _DESCRIPTIONS[self]
+
+    @property
+    def extraction_model(self) -> PrebuiltModel | None:
+        """The prebuilt model that extracts fields from this type.
+
+        ``None`` for types with no extraction path yet. Those still classify
+        and are still stored -- they just skip the extraction step.
+        """
+        return EXTRACTION_MODEL_BY_TYPE.get(self)
+
+    @property
+    def is_extractable(self) -> bool:
+        """Whether structured extraction is supported for this type."""
+        return self.extraction_model is not None
 
     @classmethod
     def values(cls) -> list[str]:
@@ -88,6 +123,17 @@ _DESCRIPTIONS: Mapping[DocumentType, str] = MappingProxyType(
         ),
         DocumentType.ID_CARD: "a passport, driving licence or identity card",
         DocumentType.UNSUPPORTED: "anything else",
+    }
+)
+
+#: Which prebuilt model extracts each document type. Only the types listed
+#: here have an extraction path; add a line to support another.
+EXTRACTION_MODEL_BY_TYPE: Mapping[DocumentType, PrebuiltModel] = MappingProxyType(
+    {
+        DocumentType.INVOICE: PrebuiltModel.INVOICE,
+        DocumentType.RECEIPT: PrebuiltModel.RECEIPT,
+        DocumentType.CONTRACT: PrebuiltModel.LAYOUT,
+        DocumentType.RESUME: PrebuiltModel.READ,
     }
 )
 

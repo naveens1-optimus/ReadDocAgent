@@ -26,6 +26,7 @@ class AzureBlobStorageService(IBlobStorageService):
             settings.connection_string.get_secret_value()
         )
         self._upload_with_retry = azure_retry(retry_policy)(self._upload_once)
+        self._download_with_retry = azure_retry(retry_policy)(self._download_once)
         # Containers already confirmed to exist, so we only pay for the check
         # once per container per process.
         self._known_containers: set[str] = set()
@@ -48,6 +49,20 @@ class AzureBlobStorageService(IBlobStorageService):
             extra={"container": container, "blob_name": blob_name},
         )
         return url
+
+    @traceable(name="blob_download", run_type="tool")
+    def download(self, container: str, blob_name: str) -> bytes:
+        """Download a blob's bytes."""
+        data = self._download_with_retry(container, blob_name)
+        logger.info(
+            "Downloaded %s bytes from %s/%s", len(data), container, blob_name,
+            extra={"container": container, "blob_name": blob_name},
+        )
+        return data
+
+    def _download_once(self, container: str, blob_name: str) -> bytes:
+        blob = self._client.get_blob_client(container=container, blob=blob_name)
+        return blob.download_blob().readall()
 
     def _upload_once(
         self,

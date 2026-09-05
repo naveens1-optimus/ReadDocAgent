@@ -1,6 +1,9 @@
 # ---------------------------------------------------------------------------
 # Multi-Agent Intelligent Document Processing (IDP) Pipeline
-# Python 3.11.x  --  pinned for reproducible builds.
+# Python 3.11+  --  pinned for reproducible builds.
+#
+# backend/pyproject.toml is the canonical dependency list; this file mirrors
+# it so `pip install -r` keeps working. A test asserts they never drift.
 #
 #   pip install -r requirements.txt
 # ---------------------------------------------------------------------------
@@ -28,6 +31,8 @@ langsmith==0.12.1
 # --- Azure services (key-based authentication) -----------------------------
 azure-ai-documentintelligence==1.0.2
 azure-storage-blob==12.30.1
+# Validated entities are written to their own Cosmos container.
+azure-cosmos==4.16.4
 azure-core==1.41.0
 
 # --- API layer -------------------------------------------------------------

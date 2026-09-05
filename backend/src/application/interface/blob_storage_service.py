@@ -19,3 +19,11 @@ class IBlobStorageService(ABC):
         content_type: str | None = None,
     ) -> str:
         """Upload bytes and return the blob URL. Creates the container if needed."""
+
+    @abstractmethod
+    def download(self, container: str, blob_name: str) -> bytes:
+        """Download a blob's bytes.
+
+        Extraction re-reads the stored document rather than carrying its
+        bytes through the graph, so a paused run's checkpoint stays small.
+        """

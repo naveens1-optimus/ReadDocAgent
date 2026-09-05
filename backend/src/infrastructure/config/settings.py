@@ -101,6 +101,7 @@ def _build_cosmos_db_settings() -> CosmosDbSettings:
         key=load_required_env("AZURE_COSMOS_KEY"),
         database_name=get_env("AZURE_COSMOS_DATABASE", "idp_langgraph"),
         container_name=get_env("AZURE_COSMOS_CONTAINER", "checkpoints"),
+        entity_container=get_env("AZURE_COSMOS_ENTITY_CONTAINER", "entities"),
     )
 
 

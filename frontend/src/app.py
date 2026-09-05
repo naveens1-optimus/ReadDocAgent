@@ -8,7 +8,9 @@ Talks to three endpoints:
 
     GET  /health/ready              can the backend do work?
     POST /documents                 upload and run the graph
-    POST /documents/{id}/approval   resume a run paused for approval
+    POST /documents/{id}/approval   resume a run paused at any of the three
+                                    checkpoints -- classification, extraction
+                                    review, or missing-field completion
 
 Requests are made from Streamlit's own Python process, not the browser, so no
 CORS configuration is needed on the API.
@@ -16,9 +18,11 @@ CORS configuration is needed on the API.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -33,8 +37,12 @@ SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "bmp", "tif", "tiff", "heif"]
 STATUS_COLOURS = {
     "completed": "green",
     "approved": "green",
+    "validated": "green",
     "awaiting_approval": "orange",
+    "awaiting_extraction_review": "orange",
+    "awaiting_field_completion": "orange",
     "classified": "blue",
+    "extracted": "blue",
     "rejected": "red",
     "failed": "red",
 }
@@ -81,16 +89,24 @@ def submit_approval(
     api_url: str,
     document_id: str,
     approved: bool,
-    document_type: str | None,
-    reviewer: str | None,
-    note: str | None,
+    document_type: str | None = None,
+    fields: dict | None = None,
+    skip: bool = False,
+    reviewer: str | None = None,
+    note: str | None = None,
 ) -> dict:
-    """Resume a paused run with the reviewer's decision."""
+    """Resume a paused run with the reviewer's decision.
+
+    ``document_type`` answers the classification gate; ``fields`` answers the
+    extraction gate with the finalised JSON.
+    """
     response = requests.post(
         f"{api_url}/documents/{document_id}/approval",
         json={
             "approved": approved,
             "document_type": document_type,
+            "fields": fields,
+            "skip": skip,
             "reviewer": reviewer or None,
             "note": note or None,
         },
@@ -136,8 +152,14 @@ def render_sidebar() -> str:
 
 
 def render_approval(api_url: str, result: dict) -> None:
-    """Draw the human-in-the-loop approval form for a paused run."""
+    """Draw the form for whichever checkpoint the run is paused at."""
     request = result.get("approval_request") or {}
+    if request.get("stage") == "extraction":
+        render_extraction_review(api_url, result, request)
+        return
+    if request.get("stage") == "field_completion":
+        render_field_completion(api_url, result, request)
+        return
 
     st.warning("The classifier was not confident enough, so the run paused here.")
 
@@ -194,6 +216,185 @@ def render_approval(api_url: str, result: dict) -> None:
     st.rerun()
 
 
+def render_extraction_review(api_url: str, result: dict, request: dict) -> None:
+    """Let the reviewer check and edit the extracted JSON before it is saved."""
+    st.warning(
+        "Check the extracted data. Edit any value before approving -- what you "
+        "approve here is what gets saved."
+    )
+    st.caption(
+        f"Extracted from a **{request.get('document_type')}** using "
+        f"`{request.get('model_id')}`."
+    )
+
+    extracted = request.get("fields") or []
+    originals = {field["name"]: field.get("value") for field in extracted}
+
+    table = pd.DataFrame(
+        [
+            {
+                "field": field["name"],
+                "value": _to_cell(field.get("value")),
+                "confidence": field.get("confidence"),
+            }
+            for field in extracted
+        ]
+    )
+
+    with st.form("extraction_form"):
+        edited = st.data_editor(
+            table,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "field": st.column_config.TextColumn("Field"),
+                "value": st.column_config.TextColumn("Value"),
+                "confidence": st.column_config.ProgressColumn(
+                    "Confidence",
+                    help=(
+                        "Document Intelligence's score for this field. "
+                        "Blank means it reports none."
+                    ),
+                    min_value=0.0,
+                    max_value=1.0,
+                    format="%.2f",
+                ),
+            },
+            disabled=["confidence"],
+        )
+        reviewer = st.text_input("Your name (optional)")
+        note = st.text_input("Note (optional)")
+
+        approve_column, reject_column = st.columns(2)
+        approved = approve_column.form_submit_button(
+            "Approve & save", type="primary", use_container_width=True
+        )
+        rejected = reject_column.form_submit_button(
+            "Reject", use_container_width=True
+        )
+
+    if not (approved or rejected):
+        return
+
+    with st.spinner("Saving..."):
+        try:
+            st.session_state.result = submit_approval(
+                api_url,
+                result["document_id"],
+                approved=approved,
+                fields=_rows_to_json(edited, originals),
+                reviewer=reviewer,
+                note=note,
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            st.error(str(exc))
+            return
+    st.rerun()
+
+
+def render_field_completion(api_url: str, result: dict, request: dict) -> None:
+    """Ask the reviewer for required fields the extraction could not read."""
+    missing = list(request.get("missing_fields") or [])
+
+    st.error(
+        f"The {request.get('document_type')} schema requires "
+        f"{len(missing)} field(s) the extraction could not read."
+    )
+
+    for message in request.get("failed_checks") or []:
+        st.caption(f"· {message}")
+
+    with st.form("completion_form"):
+        supplied: dict[str, str] = {}
+        for name in missing:
+            supplied[name] = st.text_input(name, key=f"missing_{name}")
+
+        reviewer = st.text_input("Your name (optional)")
+        skip = st.checkbox(
+            "Continue without these fields",
+            help=(
+                "The run finishes and the output is saved, but no validated "
+                "entity is stored, because the data is incomplete."
+            ),
+        )
+        submitted = st.form_submit_button(
+            "Submit", type="primary", use_container_width=True
+        )
+
+    with st.expander("Data extracted so far"):
+        st.json(request.get("current") or {})
+
+    if not submitted:
+        return
+
+    filled = {name: value for name, value in supplied.items() if value.strip()}
+    if not filled and not skip:
+        st.warning(
+            "Fill in at least one field, or tick 'Continue without these fields'."
+        )
+        return
+
+    with st.spinner("Re-validating..."):
+        try:
+            st.session_state.result = submit_approval(
+                api_url,
+                result["document_id"],
+                approved=True,
+                fields=filled or None,
+                skip=skip,
+                reviewer=reviewer,
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            st.error(str(exc))
+            return
+    st.rerun()
+
+
+def _to_cell(value: Any) -> str:
+    """Render a value for the editor. Nested values become JSON text."""
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _from_cell(text: Any, original: Any) -> Any:
+    """Convert an edited cell back to the original value's type.
+
+    Keeping the original type matters: a field extracted as a number should
+    stay a number, while an id like "0042" must stay a string rather than
+    being silently turned into 42.
+    """
+    text = str(text or "").strip()
+    if text == "":
+        return None
+    if isinstance(original, bool):
+        return text.lower() in {"true", "1", "yes"}
+    if isinstance(original, (int, float)):
+        try:
+            return float(text) if "." in text else int(text)
+        except ValueError:
+            return text
+    if isinstance(original, (dict, list)):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return text
+
+
+def _rows_to_json(rows: Any, originals: dict[str, Any]) -> dict[str, Any]:
+    """Turn the edited table back into the finalised JSON."""
+    finalised: dict[str, Any] = {}
+    for row in rows.to_dict("records"):
+        name = str(row.get("field") or "").strip()
+        if not name:
+            continue
+        finalised[name] = _from_cell(row.get("value"), originals.get(name))
+    return finalised
+
+
 def render_result(result: dict) -> None:
     """Draw the outcome of a run."""
     status = str(result.get("status", "unknown"))
@@ -215,6 +416,57 @@ def render_result(result: dict) -> None:
 
     if result.get("error"):
         st.error(result["error"])
+
+    if result.get("summary"):
+        st.info(result["summary"])
+
+    if result.get("missing_fields"):
+        st.warning(
+            "Saved without required field(s): "
+            + ", ".join(result["missing_fields"])
+            + " -- no entity was stored."
+        )
+
+    entity = result.get("entity")
+    if entity:
+        st.markdown("#### Validated entity")
+        st.caption("Stored in Cosmos DB against this document id.")
+        st.json(entity)
+
+    checks = result.get("validation_checks") or []
+    if checks:
+        with st.expander(
+            f"Validation ({sum(1 for c in checks if c['passed'])}/{len(checks)} passed)"
+        ):
+            for check in checks:
+                mark = ":green[PASS]" if check["passed"] else ":red[FAIL]"
+                st.markdown(f"- {mark} **{check['name']}** — {check['message']}")
+
+    fields = result.get("fields") or []
+    if fields:
+        st.markdown("#### Extracted data")
+        if result.get("extraction_model"):
+            st.caption(f"Model: `{result['extraction_model']}`")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "field": field["name"],
+                        "value": _to_cell(field.get("value")),
+                        "confidence": field.get("confidence"),
+                        "edited": bool(field.get("edited")),
+                    }
+                    for field in fields
+                ]
+            ),
+            hide_index=True,
+            column_config={
+                "confidence": st.column_config.ProgressColumn(
+                    "Confidence", min_value=0.0, max_value=1.0, format="%.2f"
+                ),
+                "edited": st.column_config.CheckboxColumn("Edited"),
+            },
+        )
 
     st.caption(f"Document id: `{result.get('document_id', '')}`")
 
