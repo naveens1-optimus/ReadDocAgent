@@ -7,7 +7,7 @@ name = "doc-int-agent-system"
 version = "0.1.0"
 description = "Multi-agent Intelligent Document Processing pipeline on LangGraph and Azure AI"
 requires-python = ">=3.11"
-readme = "../README.md"
+readme = "README.md"
 
 # The canonical dependency list. src/requirements.txt mirrors this for
 # `pip install -r`; a test asserts the two never drift apart.
@@ -47,6 +47,11 @@ dependencies = [
     # --- Document rendering (PDF page -> image for the vision classifier) ---
     "pymupdf==1.28.2",
     "pillow==12.3.0",
+
+    # --- Frontend ---
+    "streamlit==1.63.0",
+    "requests==2.34.2", 
+
 ]
 
 [project.optional-dependencies]
@@ -59,7 +64,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["backend/src"]
 
 [tool.pytest.ini_options]
 # `src` on the import path so tests import the same way the app does

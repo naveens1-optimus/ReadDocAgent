@@ -95,48 +95,117 @@ distinguishes an extracted value from a corrected one.
 
 Requires **Python 3.11**.
 
+### 1. Create the virtual environment
+
+From the project root:
+
 ```bash
-cd backend
-python -m venv venv
-./venv/Scripts/python.exe -m pip install -r src/requirements.txt   # Windows
-./venv/Scripts/python.exe -m pip install -r ../frontend/requirements.txt
+cd doc_int_agent_system
+
+python -m venv .venv
 ```
 
-Then fill in `backend/src/.env`. It already contains the **required** settings
-with placeholder values -- replace each `REPLACE-ME`:
+Activate the virtual environment.
+
+**Windows PowerShell:**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+**Windows CMD:**
+
+```cmd
+.\.venv\Scripts\activate
+```
+
+### 2. Install the project dependencies
+
+The project uses the root-level `pyproject.toml` as the canonical dependency configuration.
+
+Install the application and development dependencies with:
+
+```bash
+python -m pip install --upgrade pip
+pip install -e ".[dev]"
+```
+
+This installs the dependencies defined in `pyproject.toml`, including the backend runtime dependencies and development/test dependencies.
+
+### 3. Configure environment variables
+
+Create or update:
+
+```text
+backend/src/.env
+```
+
+The `.env` file contains the required settings with placeholder values. Replace each `REPLACE-ME` value with the corresponding Azure resource configuration.
 
 | Variable | Where to find it |
 |---|---|
-| `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` / `_KEY` | Document Intelligence resource → Keys and Endpoint |
-| `AZURE_OPENAI_ENDPOINT` / `_KEY` | Azure OpenAI resource → Keys and Endpoint |
-| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Your **deployment name** in AI Foundry (must be vision-capable, e.g. a `gpt-4o` deployment) |
-| `AZURE_STORAGE_CONNECTION_STRING` | Storage account → Access keys → Connection string |
-| `AZURE_COSMOS_ENDPOINT` / `_KEY` | Cosmos DB account (NoSQL API) → Keys |
+| `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` / `AZURE_DOCUMENT_INTELLIGENCE_KEY` | Azure Document Intelligence resource → **Keys and Endpoint** |
+| `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_KEY` | Azure OpenAI resource → **Keys and Endpoint** |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Azure AI Foundry → your **deployment name**. The deployment must support vision, such as a `gpt-4o` deployment |
+| `AZURE_STORAGE_CONNECTION_STRING` | Azure Storage Account → **Access keys** → Connection string |
+| `AZURE_COSMOS_ENDPOINT` / `AZURE_COSMOS_KEY` | Azure Cosmos DB account using the **NoSQL API** → **Keys** |
 
-Everything else has a working default and is documented in
-[backend/src/.env.example](backend/src/.env.example) -- add a line to `.env`
-only to override one. Blob containers and the Cosmos database/container are
-created automatically; only the accounts themselves must exist.
+Other configuration values have working defaults and are documented in:
 
-Authentication is **key-based** throughout. `.env` is git-ignored.
-
-## Running
-
-Two processes.
-
-```bash
-# Terminal 1 -- API on http://127.0.0.1:8000
-cd backend/src
-../venv/Scripts/python.exe main.py
-
-# Terminal 2 -- UI on http://localhost:8501
-./backend/venv/Scripts/python.exe -m streamlit run frontend/src/app.py
+```text
+backend/src/.env.example
 ```
 
-The UI sidebar shows backend readiness. If it says *Not ready*, it names the
-setting that is wrong.
+Add a value to `.env` only when you need to override the default.
 
-`http://127.0.0.1:8000/docs` has the interactive API docs.
+The application automatically creates the required Blob Storage containers and Cosmos DB database/container. The corresponding Azure accounts must already exist.
+
+Authentication is **key-based** throughout the application.
+
+The `.env` file is git-ignored and should not be committed to source control.
+
+### 4. Run the backend
+
+Open a terminal and activate the project environment:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Then start the backend:
+
+```bash
+cd backend/src
+python main.py
+```
+
+The API will be available at:
+
+```text
+http://127.0.0.1:8000
+```
+
+Interactive API documentation is available at:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### 5. Run the frontend
+
+Open a **second terminal**, activate the same virtual environment, and start Streamlit from the project root:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m streamlit run frontend/src/app.py
+```
+
+The UI will be available at:
+
+```text
+http://localhost:8501
+```
+
 
 ## Endpoints
 
