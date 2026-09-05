@@ -6,12 +6,12 @@ worker thread -- the Azure SDK clients underneath are synchronous.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import ValidationError
 
 from application.handler.process_document_handler import (
     ProcessDocumentHandler,
-    UnknownThreadError,
+    UnknownDocumentError,
 )
 from domain.schema.human_review_request import HumanReviewRequest
 from domain.schema.process_document_response import ProcessDocumentResponse
@@ -46,14 +46,20 @@ def _get_handler(request: Request) -> ProcessDocumentHandler:
     description=(
         "Stores the document in Blob Storage and runs the LangGraph pipeline: "
         "classify, then the human approval checkpoint, then save.\n\n"
+        "Omit `session_id` on the first upload and the API generates one; send "
+        "it back on later uploads to keep them in the same session.\n\n"
         "If the classifier is confident the run completes immediately. If not, "
-        "it pauses and the response has `awaiting_approval: true` with an "
-        "`approval_request` payload -- send the decision to "
-        "`POST /documents/{thread_id}/approval` to continue."
+        "the response has `awaiting_approval: true` with an `approval_request` "
+        "payload -- send the decision to "
+        "`POST /documents/{document_id}/approval` to continue."
     ),
 )
 def upload_document(
-    request: Request, file: UploadFile = File(...)
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: str | None = Form(
+        default=None, description="Omit on the first upload; the API returns one."
+    ),
 ) -> ProcessDocumentResponse:
     """Accept a PDF or image and run it through the pipeline."""
     handler = _get_handler(request)
@@ -71,7 +77,7 @@ def upload_document(
         ) from exc
 
     try:
-        return handler.handle(upload, data)
+        return handler.handle(upload, data, session_id=session_id or None)
     except ValueError as exc:  # size limit
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)
@@ -79,7 +85,7 @@ def upload_document(
 
 
 @router.post(
-    "/{thread_id}/approval",
+    "/{document_id}/approval",
     response_model=ProcessDocumentResponse,
     summary="Approve or reject a paused classification",
     description=(
@@ -88,29 +94,29 @@ def upload_document(
     ),
 )
 def submit_approval(
-    request: Request, thread_id: str, review: HumanReviewRequest
+    request: Request, document_id: str, review: HumanReviewRequest
 ) -> ProcessDocumentResponse:
     """Resume a paused run with a reviewer's decision."""
     handler = _get_handler(request)
     try:
-        return handler.resume(thread_id, review)
-    except UnknownThreadError as exc:
+        return handler.resume(document_id, review)
+    except UnknownDocumentError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
 
 
 @router.get(
-    "/{thread_id}",
+    "/{document_id}",
     response_model=ProcessDocumentResponse,
-    summary="Get the status of a run",
+    summary="Get the status of a document",
 )
-def get_document(request: Request, thread_id: str) -> ProcessDocumentResponse:
+def get_document(request: Request, document_id: str) -> ProcessDocumentResponse:
     """Return the current state of a run, including any pending approval."""
     handler = _get_handler(request)
     try:
-        return handler.get_status(thread_id)
-    except UnknownThreadError as exc:
+        return handler.get_status(document_id)
+    except UnknownDocumentError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc

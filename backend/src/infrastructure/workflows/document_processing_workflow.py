@@ -245,6 +245,7 @@ class DocumentProcessingWorkflow:
         """Write the classification result to Blob Storage."""
         payload = {
             "document_id": state.document_id,
+            "session_id": state.session_id,
             "file_name": state.file_name,
             "input_blob_url": state.input_blob_url,
             "classification": (
@@ -264,7 +265,9 @@ class DocumentProcessingWorkflow:
         try:
             url = self._storage.upload(
                 container=self._settings.blob_storage.output_container,
-                blob_name=f"{state.document_id}/classification.json",
+                blob_name=(
+                f"{state.session_id}/{state.document_id}/classification.json"
+            ),
                 data=data,
                 content_type="application/json",
             )

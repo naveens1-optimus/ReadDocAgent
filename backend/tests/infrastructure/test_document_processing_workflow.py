@@ -53,6 +53,7 @@ def make_workflow(
 def initial_state(document_id: str = "doc-1") -> DocumentState:
     return DocumentState(
         document_id=document_id,
+        session_id="sess-1",
         file_name="invoice.png",
         content_type="image/png",
         extension=".png",
@@ -92,7 +93,7 @@ class TestConfidentClassification:
 
         upload = storage.uploads[0]
         assert upload["container"] == settings.blob_storage.output_container
-        assert upload["blob_name"] == "doc-1/classification.json"
+        assert upload["blob_name"] == "sess-1/doc-1/classification.json"
         assert upload["content_type"] == "application/json"
         assert DocumentState.model_validate(result).output_blob_url is not None
 

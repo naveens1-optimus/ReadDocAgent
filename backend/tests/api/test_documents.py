@@ -104,26 +104,30 @@ class TestUpload:
         assert body["document_type"] == "invoice"
         assert body["confidence"] == pytest.approx(0.94)
         assert body["awaiting_approval"] is False
-        assert body["thread_id"]
-        assert body["output_blob_url"]
+        assert body["document_id"]
+        assert body["session_id"]
 
-    def test_stores_the_input_document(self, make_harness) -> None:
+    def test_stores_the_input_document_and_the_result(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
 
-        body = upload(harness.client).json()
+        upload(harness.client)
 
         containers = [item["container"] for item in harness.storage.uploads]
         assert "idp-input" in containers
         assert "idp-output" in containers
-        assert body["input_blob_url"]
 
-    def test_returns_the_audit_trail(self, make_harness) -> None:
+    def test_response_omits_internals(self, make_harness) -> None:
+        """Blob URLs and the audit trail stay server-side.
+
+        Both are still recorded -- the trail in graph state, and both in the
+        saved result JSON -- but the response is a summary, not a run dump.
+        """
         harness = make_harness(CONFIDENT)
 
         body = upload(harness.client).json()
 
-        agents = [entry["agent"] for entry in body["audit_trail"]]
-        assert agents == ["classify", "human_approval", "save"]
+        for field in ("audit_trail", "input_blob_url", "output_blob_url"):
+            assert field not in body
 
     def test_rejects_unsupported_file_type(self, make_harness) -> None:
         harness = make_harness()
@@ -183,10 +187,10 @@ class TestApprovalCheckpoint:
 
     def test_approving_completes_the_run(self, make_harness) -> None:
         harness = make_harness(UNSURE)
-        thread_id = upload(harness.client).json()["thread_id"]
+        document_id = upload(harness.client).json()["document_id"]
 
         response = harness.client.post(
-            f"/documents/{thread_id}/approval",
+            f"/documents/{document_id}/approval",
             json={"approved": True, "reviewer": "naveen"},
         )
 
@@ -194,14 +198,15 @@ class TestApprovalCheckpoint:
         body = response.json()
         assert body["status"] == "completed"
         assert body["awaiting_approval"] is False
-        assert body["output_blob_url"]
+        # The save still happened, it is just not echoed back.
+        assert "idp-output" in [i["container"] for i in harness.storage.uploads]
 
     def test_rejecting_marks_the_run_rejected(self, make_harness) -> None:
         harness = make_harness(UNSURE)
-        thread_id = upload(harness.client).json()["thread_id"]
+        document_id = upload(harness.client).json()["document_id"]
 
         body = harness.client.post(
-            f"/documents/{thread_id}/approval",
+            f"/documents/{document_id}/approval",
             json={"approved": False, "note": "not an invoice"},
         ).json()
 
@@ -209,31 +214,31 @@ class TestApprovalCheckpoint:
 
     def test_reviewer_can_correct_the_type(self, make_harness) -> None:
         harness = make_harness(UNSURE)
-        thread_id = upload(harness.client).json()["thread_id"]
+        document_id = upload(harness.client).json()["document_id"]
 
         body = harness.client.post(
-            f"/documents/{thread_id}/approval",
+            f"/documents/{document_id}/approval",
             json={"approved": True, "document_type": "receipt"},
         ).json()
 
         assert body["document_type"] == "receipt"
         assert body["status"] == "completed"
 
-    def test_unknown_thread_returns_404(self, make_harness) -> None:
+    def test_unknown_document_returns_404(self, make_harness) -> None:
         harness = make_harness()
 
         response = harness.client.post(
-            "/documents/no-such-thread/approval", json={"approved": True}
+            "/documents/no-such-document/approval", json={"approved": True}
         )
 
         assert response.status_code == 404
 
     def test_invalid_correction_type_is_rejected(self, make_harness) -> None:
         harness = make_harness(UNSURE)
-        thread_id = upload(harness.client).json()["thread_id"]
+        document_id = upload(harness.client).json()["document_id"]
 
         response = harness.client.post(
-            f"/documents/{thread_id}/approval",
+            f"/documents/{document_id}/approval",
             json={"approved": True, "document_type": "spaceship"},
         )
 
@@ -243,9 +248,9 @@ class TestApprovalCheckpoint:
 class TestStatus:
     def test_reports_a_completed_run(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
-        thread_id = upload(harness.client).json()["thread_id"]
+        document_id = upload(harness.client).json()["document_id"]
 
-        body = harness.client.get(f"/documents/{thread_id}").json()
+        body = harness.client.get(f"/documents/{document_id}").json()
 
         assert body["status"] == "completed"
         assert body["document_type"] == "invoice"
@@ -254,14 +259,93 @@ class TestStatus:
         self, make_harness
     ) -> None:
         harness = make_harness(UNSURE)
-        thread_id = upload(harness.client).json()["thread_id"]
+        document_id = upload(harness.client).json()["document_id"]
 
-        body = harness.client.get(f"/documents/{thread_id}").json()
+        body = harness.client.get(f"/documents/{document_id}").json()
 
         assert body["status"] == "awaiting_approval"
         assert body["approval_request"]["confidence"] == pytest.approx(0.41)
 
-    def test_unknown_thread_returns_404(self, make_harness) -> None:
+    def test_unknown_document_returns_404(self, make_harness) -> None:
         harness = make_harness()
 
         assert harness.client.get("/documents/nope").status_code == 404
+
+
+class TestSessions:
+    """A session groups uploads; each document still runs in isolation."""
+
+    def test_api_generates_a_session_id_on_first_upload(self, make_harness) -> None:
+        harness = make_harness(CONFIDENT)
+
+        body = upload(harness.client).json()
+
+        assert body["session_id"]
+
+    def test_supplied_session_id_is_reused(self, make_harness) -> None:
+        harness = make_harness(CONFIDENT)
+        first = upload(harness.client).json()
+
+        second = harness.client.post(
+            "/documents",
+            files={"file": ("second.png", PNG_BYTES, "image/png")},
+            data={"session_id": first["session_id"]},
+        ).json()
+
+        assert second["session_id"] == first["session_id"]
+        assert second["document_id"] != first["document_id"]
+
+    def test_separate_uploads_get_separate_sessions_by_default(
+        self, make_harness
+    ) -> None:
+        harness = make_harness(CONFIDENT)
+
+        first = upload(harness.client).json()
+        second = upload(harness.client, name="other.png").json()
+
+        assert first["session_id"] != second["session_id"]
+
+    def test_blobs_are_grouped_under_the_session(self, make_harness) -> None:
+        harness = make_harness(CONFIDENT)
+
+        body = upload(harness.client).json()
+
+        for item in harness.storage.uploads:
+            assert item["blob_name"].startswith(
+                f"{body['session_id']}/{body['document_id']}/"
+            )
+
+    def test_two_documents_in_one_session_stay_isolated(
+        self, make_harness
+    ) -> None:
+        """The second upload must not clobber an approval pending on the first.
+
+        Both documents share a session, so this is the case that a single
+        shared graph thread would break.
+        """
+        harness = make_harness(UNSURE)
+        first = upload(harness.client).json()
+        assert first["awaiting_approval"] is True
+
+        second = harness.client.post(
+            "/documents",
+            files={"file": ("second.png", PNG_BYTES, "image/png")},
+            data={"session_id": first["session_id"]},
+        ).json()
+        assert second["awaiting_approval"] is True
+
+        # The first is still paused and independently resumable.
+        still_pending = harness.client.get(
+            f"/documents/{first['document_id']}"
+        ).json()
+        assert still_pending["status"] == "awaiting_approval"
+
+        done = harness.client.post(
+            f"/documents/{first['document_id']}/approval",
+            json={"approved": True},
+        ).json()
+        assert done["status"] == "completed"
+
+        # Resolving the first left the second untouched.
+        other = harness.client.get(f"/documents/{second['document_id']}").json()
+        assert other["status"] == "awaiting_approval"
