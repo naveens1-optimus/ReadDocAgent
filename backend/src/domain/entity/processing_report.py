@@ -39,8 +39,11 @@ class _FieldSummary(BaseModel):
     name: str
     value: Any = None
     confidence: float | None = None
+    #: What Document Intelligence scored before a human approved it.
+    original_confidence: float | None = None
     low_confidence: bool = False
     edited_by_reviewer: bool = False
+    verified_by_reviewer: bool = False
     pages: list[int] = Field(default_factory=list)
     #: ``(min_x, min_y, max_x, max_y)`` of the field's first region.
     bounding_box: tuple[float, float, float, float] | None = None
@@ -169,10 +172,16 @@ def _build_extraction(
             name=field.name,
             value=field.value,
             confidence=field.confidence,
+            original_confidence=field.original_confidence,
+            # Judged on what the machine read, not on the 1.0 a human
+            # approval confers -- otherwise the report would claim the
+            # extraction was flawless whenever someone signed it off.
             low_confidence=(
-                field.confidence is not None and field.confidence < threshold
+                _machine_score(field) is not None
+                and _machine_score(field) < threshold
             ),
             edited_by_reviewer=field.edited,
+            verified_by_reviewer=field.verified,
             pages=field.pages,
             bounding_box=(
                 field.bounding_regions[0].bounding_box
@@ -182,14 +191,28 @@ def _build_extraction(
         )
         for field in extraction.fields
     ]
-    # A reviewer reads the top of this table, so put the doubtful values there.
-    rows.sort(key=lambda row: (row.confidence is None, row.confidence or 0.0))
+    # A reviewer reads the top of this table, so put the values the machine
+    # was least sure of there -- the human-approved 1.0 would otherwise hide
+    # exactly the fields worth looking at.
+    def machine_score(row: _FieldSummary) -> float | None:
+        return row.original_confidence if row.original_confidence is not None else row.confidence
 
-    scored = [row.confidence for row in rows if row.confidence is not None]
+    rows.sort(key=lambda row: (machine_score(row) is None, machine_score(row) or 0.0))
+
+    scored = [machine_score(row) for row in rows if machine_score(row) is not None]
     return _Extraction(
         model_id=extraction.model_id,
         page_count=extraction.page_count,
         field_count=len(rows),
         average_confidence=(sum(scored) / len(scored) if scored else None),
         fields=rows,
+    )
+
+
+def _machine_score(field: Any) -> float | None:
+    """What Document Intelligence scored, ignoring any human approval."""
+    return (
+        field.original_confidence
+        if field.original_confidence is not None
+        else field.confidence
     )

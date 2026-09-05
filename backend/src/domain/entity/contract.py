@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from datetime import date
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
-from domain.entity.common import EntityModel
+from domain.entity.common import EntityModel, to_date
 
 __all__ = ["Signature", "Contract"]
 
@@ -22,6 +22,8 @@ class Signature(EntityModel):
     signatory_name: str | None = None
     party: str | None = Field(default=None, description="Which party they signed for.")
     signed_date: date | None = None
+
+    _dates = field_validator("signed_date", mode="before")(to_date)
 
 
 class Contract(EntityModel):
@@ -45,3 +47,7 @@ class Contract(EntityModel):
     )
     signatures: list[Signature] = Field(default_factory=list)
     governing_law: str | None = None
+
+    _dates = field_validator(
+        "effective_date", "expiration_date", mode="before"
+    )(to_date)

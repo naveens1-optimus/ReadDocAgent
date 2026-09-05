@@ -187,7 +187,7 @@ class TestFieldConfidence:
         fields = result["__interrupt__"][0].value["fields"]
         assert {f["name"]: f["confidence"] for f in fields} == {
             "InvoiceId": 0.97,
-            "InvoiceTotal": 0.62,
+            "InvoiceTotal": 0.91,
             # None, not 0 -- Document Intelligence reports no score for this
             # field, which is different from reporting a low one.
             "VendorName": None,
@@ -290,10 +290,14 @@ class TestReviewerEdits:
         assert final.extraction_review.reviewer == "naveen"
         assert final.status is ProcessingStatus.COMPLETED
 
-    def test_a_corrected_field_keeps_its_original_confidence(
+    def test_a_corrected_field_records_both_scores(
         self, settings: Settings
     ) -> None:
-        """The score describes what Azure read, not what the human typed."""
+        """Approval sets confidence to 1.0; Azure's own score is retained.
+
+        The report needs the original to say how well the extraction did,
+        while the stored value carries the human's sign-off.
+        """
         workflow, _, run = self._run_to_review(settings)
 
         result = workflow.graph.invoke(
@@ -315,7 +319,9 @@ class TestReviewerEdits:
         total = next(
             f for f in final.extraction.fields if f.name == "InvoiceTotal"
         )
-        assert total.confidence == 0.62
+        assert total.confidence == 1.0
+        assert total.original_confidence == 0.91
+        assert total.verified is True
         assert total.edited is True
 
     def test_unchanged_fields_are_not_marked_edited(
@@ -364,8 +370,10 @@ class TestReviewerEdits:
         )
         assert added.value == "PO-9"
         assert added.edited is True
-        # Nothing extracted it, so it carries no confidence.
-        assert added.confidence is None
+        # A human supplied it, so it is verified at full confidence...
+        assert added.confidence == 1.0
+        # ...but nothing extracted it, so there is no machine score.
+        assert added.original_confidence is None
 
     def test_approving_without_edits_saves_what_was_extracted(
         self, settings: Settings

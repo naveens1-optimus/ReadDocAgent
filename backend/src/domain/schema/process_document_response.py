@@ -45,7 +45,9 @@ class ProcessDocumentResponse(BaseModel):
     #: flattened for consumers that only want the values.
     data: dict[str, Any] = Field(default_factory=dict)
 
-    #: The validated entity, once every required field is present.
+    #: The validated entity. Present only once every check has passed --
+    #: while validation is still failing there is no entity, and nothing has
+    #: been stored.
     entity: dict[str, Any] | None = None
 
     #: Short document summary, from enrichment.
@@ -90,7 +92,11 @@ class ProcessDocumentResponse(BaseModel):
             extraction_model=extraction.model_id if extraction else None,
             fields=list(extraction.fields) if extraction else [],
             data=extraction.to_json() if extraction else {},
-            entity=validation.entity if validation else None,
+            entity=(
+                validation.entity
+                if validation is not None and validation.passed
+                else None
+            ),
             summary=validation.summary if validation else None,
             missing_fields=list(validation.missing_fields) if validation else [],
             low_confidence_fields=(
@@ -116,6 +122,6 @@ def _paused_status(approval_request: dict[str, Any] | None) -> ProcessingStatus 
     stage = approval_request.get("stage")
     if stage == "extraction":
         return ProcessingStatus.AWAITING_EXTRACTION_REVIEW
-    if stage == "field_completion":
-        return ProcessingStatus.AWAITING_FIELD_COMPLETION
+    if stage == "data_correction":
+        return ProcessingStatus.AWAITING_DATA_CORRECTION
     return ProcessingStatus.AWAITING_APPROVAL

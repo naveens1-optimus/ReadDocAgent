@@ -26,10 +26,10 @@ class HumanReviewRequest(BaseModel):
         default=None, description="Finalised {field: value} JSON."
     )
 
-    #: At the field-completion gate: continue even though required fields are
-    #: still missing. Without it a reviewer who cannot supply a value would be
-    #: asked the same question forever.
-    skip: bool = Field(default=False)
+    #: At the correction gate: end the run even though validation still
+    #: fails. Needed as an escape for a document that genuinely cannot be
+    #: corrected; no entity is stored in that case.
+    abandon: bool = Field(default=False)
 
     reviewer: str | None = Field(default=None, max_length=256)
     note: str | None = Field(default=None, max_length=2000)
@@ -46,7 +46,7 @@ class HumanReviewRequest(BaseModel):
                 self.document_type.value if self.document_type else None
             ),
             "fields": self.fields,
-            "skip": self.skip,
+            "abandon": self.abandon,
             "reviewer": self.reviewer,
             "note": self.note,
         }

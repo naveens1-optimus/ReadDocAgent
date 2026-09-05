@@ -427,9 +427,16 @@ class TestSavedPayload:
         assert payload["summary"]
 
         # ...alongside the per-field confidence it came with.
+        # Approval set every field to 1.0; the machine's own scores are kept
+        # alongside so the record still shows how the extraction did.
         scores = {f["name"]: f["confidence"] for f in payload["extraction"]["fields"]}
-        assert scores["InvoiceId"] == 0.97
-        assert scores["VendorName"] is None
+        assert scores["InvoiceId"] == 1.0
+        original = {
+            f["name"]: f["original_confidence"]
+            for f in payload["extraction"]["fields"]
+        }
+        assert original["InvoiceId"] == 0.97
+        assert original["VendorName"] is None
 
         # The report is saved on its own as well as inside the result.
         assert json.loads(captured["doc-1/report.json"])["document_id"] == "doc-1"
