@@ -11,7 +11,11 @@ from azure.core.credentials import AzureKeyCredential
 from langsmith import traceable
 
 from application.interface.document_analysis_service import IDocumentAnalysisService
-from domain.entity.extraction_result import ExtractedField, ExtractionResult
+from domain.entity.extraction_result import (
+    BoundingRegion,
+    ExtractedField,
+    ExtractionResult,
+)
 from domain.schema.settings import DocumentIntelligenceSettings, RetryPolicySettings
 from infrastructure.utilities.logging_config import get_logger
 from infrastructure.utilities.retry import azure_retry
@@ -67,6 +71,7 @@ class AzureDocumentIntelligenceService(IDocumentAnalysisService):
                 value=_plain_value(field),
                 confidence=_get(field, "confidence"),
                 content=_get(field, "content"),
+                bounding_regions=_regions(field),
             )
             for name, field in raw_fields.items()
         ]
@@ -165,3 +170,10 @@ def _plain_value(field: Any) -> Any:
             return _json_safe(value)
 
     return _get(field, "content")
+
+
+def _regions(field: Any) -> list[BoundingRegion]:
+    """Parse a field's bounding regions, skipping any that are unusable."""
+    raw = _get(field, "bounding_regions") or []
+    parsed = (BoundingRegion.from_azure(region) for region in raw)
+    return [region for region in parsed if region is not None]
