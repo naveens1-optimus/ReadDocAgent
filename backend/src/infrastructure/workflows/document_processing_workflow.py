@@ -16,10 +16,10 @@ document type is known.
 from __future__ import annotations
 
 import json
-import sqlite3
 from typing import Any
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_azure_cosmosdb import CosmosDBSaverSync
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -27,7 +27,7 @@ from application.interface.blob_storage_service import IBlobStorageService
 from domain.entity.audit_entry import AuditEntry
 from domain.enum.document_type import DocumentType
 from domain.enum.processing_status import AgentName, ProcessingStatus
-from domain.schema.settings import Settings
+from domain.schema.settings import CosmosDbSettings, Settings
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -39,16 +39,24 @@ __all__ = ["DocumentProcessingWorkflow", "build_checkpointer"]
 logger = get_logger(__name__)
 
 
-def build_checkpointer(database_path: str) -> SqliteSaver:
-    """Open the SQLite checkpointer used to pause and resume runs.
+def build_checkpointer(settings: CosmosDbSettings) -> BaseCheckpointSaver:
+    """Open the Cosmos DB checkpointer used to pause and resume runs.
 
     Persistent rather than in-memory because approval arrives on a *later*
-    HTTP request, so the paused state has to outlive the request that created
-    it. ``check_same_thread=False`` because FastAPI runs sync endpoints on
-    worker threads, so the connection is used from more than one.
+    HTTP request -- often against a different process -- so the paused state
+    has to outlive the request that created it.
+
+    Uses the synchronous saver to match the rest of the stack, and passes the
+    account key explicitly so key-based auth is used rather than the
+    ``DefaultAzureCredential`` fallback. The database and container are
+    created on first use.
     """
-    connection = sqlite3.connect(database_path, check_same_thread=False)
-    return SqliteSaver(connection)
+    return CosmosDBSaverSync(
+        database_name=settings.database_name,
+        container_name=settings.container_name,
+        endpoint=settings.endpoint,
+        key=settings.key.get_secret_value(),
+    )
 
 
 class DocumentProcessingWorkflow:
@@ -59,14 +67,14 @@ class DocumentProcessingWorkflow:
         classifier: DocumentClassificationAgent,
         storage: IBlobStorageService,
         settings: Settings,
-        checkpointer: SqliteSaver,
+        checkpointer: BaseCheckpointSaver,
     ) -> None:
         self._classifier = classifier
         self._storage = storage
         self._settings = settings
         self.graph = self._build(checkpointer)
 
-    def _build(self, checkpointer: SqliteSaver) -> Any:
+    def _build(self, checkpointer: BaseCheckpointSaver) -> Any:
         builder = StateGraph(DocumentState)
 
         builder.add_node(AgentName.CLASSIFIER.value, self._classify)

@@ -55,7 +55,7 @@ def register_services(container: DIContainer, settings: Settings) -> None:
         classifier=classifier,
         storage=storage,
         settings=settings,
-        checkpointer=build_checkpointer(settings.app.checkpoint_db_path),
+        checkpointer=build_checkpointer(settings.cosmos_db),
     )
     container.register(DocumentProcessingWorkflow, workflow)
 

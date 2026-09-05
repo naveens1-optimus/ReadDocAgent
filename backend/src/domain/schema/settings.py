@@ -31,6 +31,7 @@ __all__ = [
     "DocumentIntelligenceSettings",
     "AzureOpenAISettings",
     "BlobStorageSettings",
+    "CosmosDbSettings",
     "LangSmithSettings",
     "RetryPolicySettings",
     "AppSettings",
@@ -168,6 +169,34 @@ class BlobStorageSettings(_StrictModel):
         return name
 
 
+class CosmosDbSettings(_StrictModel):
+    """Azure Cosmos DB settings for the LangGraph checkpointer.
+
+    The checkpointer is what makes the human-in-the-loop pause durable: a run
+    pauses on one request and resumes on a later one, so the saved state has
+    to outlive the process that created it.
+
+    The database and container are created on first use, so only the account
+    needs to exist beforehand.
+    """
+
+    endpoint: str = Field(
+        description="Account endpoint, e.g. https://<name>.documents.azure.com:443/"
+    )
+    key: SecretStr = Field(description="Account primary or secondary key.")
+    database_name: str = Field(default="idp_langgraph")
+    container_name: str = Field(default="checkpoints")
+
+    _normalise = field_validator("endpoint")(_normalise_endpoint)
+
+    @field_validator("database_name", "container_name")
+    @classmethod
+    def _require_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Cosmos DB database and container names must not be empty")
+        return value.strip()
+
+
 class LangSmithSettings(_StrictModel):
     """LangSmith tracing settings.
 
@@ -242,10 +271,6 @@ class AppSettings(_StrictModel):
         ge=0.0,
         description="Absolute tolerance when cross-validating money totals.",
     )
-    checkpoint_db_path: str = Field(
-        default="./checkpoints.sqlite",
-        description="SQLite file backing the LangGraph checkpointer.",
-    )
     max_upload_size_mb: int = Field(default=20, gt=0, le=500)
 
     @property
@@ -271,6 +296,7 @@ class Settings(_StrictModel):
     document_intelligence: DocumentIntelligenceSettings
     azure_openai: AzureOpenAISettings
     blob_storage: BlobStorageSettings
+    cosmos_db: CosmosDbSettings
     langsmith: LangSmithSettings
     retry: RetryPolicySettings
 
@@ -300,6 +326,7 @@ class Settings(_StrictModel):
                 f"retry                : {self.retry.max_attempts} attempts, base "
                 f"{self.retry.base_delay_seconds}s, max "
                 f"{self.retry.max_delay_seconds}s",
-                f"checkpoint db        : {self.app.checkpoint_db_path}",
+                f"checkpointer         : cosmos {self.cosmos_db.endpoint} "
+                f"({self.cosmos_db.database_name}/{self.cosmos_db.container_name})",
             )
         )

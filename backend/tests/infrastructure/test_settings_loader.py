@@ -30,6 +30,8 @@ class TestRequiredVariables:
             "AZURE_OPENAI_KEY",
             "AZURE_OPENAI_CHAT_DEPLOYMENT",
             "AZURE_STORAGE_CONNECTION_STRING",
+            "AZURE_COSMOS_ENDPOINT",
+            "AZURE_COSMOS_KEY",
         ],
     )
     def test_missing_required_variable_raises_named_error(
@@ -65,6 +67,8 @@ class TestDefaults:
         assert settings.azure_openai.api_version == "2024-10-21"
         assert settings.retry.max_attempts == 4
         assert settings.langsmith.tracing_enabled is False
+        assert settings.cosmos_db.database_name == "idp_langgraph"
+        assert settings.cosmos_db.container_name == "checkpoints"
 
     def test_vision_deployment_defaults_to_chat_deployment(
         self, valid_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
@@ -189,3 +193,33 @@ class TestNoCredentialLeak:
         assert "test-di-key" not in summary
         assert "test-aoai-key" not in summary
         assert "dGVzdC1hY2NvdW50LWtleQ==" not in summary
+
+
+class TestCosmosDbLoading:
+    """Cosmos DB backs the checkpointer, so a paused run survives a restart."""
+
+    def test_endpoint_and_key_are_loaded(self, valid_env: dict[str, str]) -> None:
+        settings = _build()
+        assert settings.cosmos_db.endpoint == (
+            "https://test-cosmos.documents.azure.com:443"
+        )
+        assert settings.cosmos_db.key.get_secret_value() == "test-cosmos-key"
+
+    def test_database_and_container_are_overridable(
+        self, valid_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AZURE_COSMOS_DATABASE", "my_db")
+        monkeypatch.setenv("AZURE_COSMOS_CONTAINER", "my_checkpoints")
+        settings = _build()
+        assert settings.cosmos_db.database_name == "my_db"
+        assert settings.cosmos_db.container_name == "my_checkpoints"
+
+    def test_key_is_not_leaked_in_summary(self, valid_env: dict[str, str]) -> None:
+        settings = _build()
+        assert "test-cosmos-key" not in settings.summary()
+        assert "test-cosmos-key" not in repr(settings)
+
+    def test_summary_reports_the_checkpointer(
+        self, valid_env: dict[str, str]
+    ) -> None:
+        assert "cosmos" in _build().summary()

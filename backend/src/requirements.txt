@@ -9,9 +9,12 @@
 # LangGraph 1.x: StateGraph, conditional edges, interrupt()/Command HITL.
 langgraph==1.2.11
 langchain-core==1.6.1
-# Durable checkpointer (SqliteSaver / AsyncSqliteSaver). Required because the
-# human-in-the-loop resume arrives on a separate HTTP request, so graph state
-# must survive between processes -- MemorySaver would not.
+# Durable checkpointer. Required because the human-in-the-loop resume arrives
+# on a separate HTTP request, so graph state must survive between processes --
+# MemorySaver would not.
+# Azure Cosmos DB checkpointer (CosmosDBSaverSync), used at runtime.
+langchain-azure-cosmosdb==1.0.0
+# SQLite checkpointer -- used only by the test suite, which must run offline.
 langgraph-checkpoint-sqlite==3.1.1
 
 # --- Azure OpenAI ----------------------------------------------------------
