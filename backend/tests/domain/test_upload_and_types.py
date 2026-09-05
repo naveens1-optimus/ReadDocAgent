@@ -98,7 +98,7 @@ class TestHumanReviewRequest:
             "approved": True,
             "document_type": "receipt",
             "fields": None,
-            "skip": False,
+            "abandon": False,
             "reviewer": "naveen",
             "note": "corrected",
         }

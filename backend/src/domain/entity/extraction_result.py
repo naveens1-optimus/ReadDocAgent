@@ -83,10 +83,15 @@ class ExtractedField(BaseModel):
     name: str
     value: Any = None
 
-    #: Document Intelligence's confidence in this field alone. ``None`` when
-    #: the model does not report one for the field -- not every field type
-    #: carries a score, so absent is different from low.
+    #: Confidence in this value. Document Intelligence's own score to begin
+    #: with -- ``None`` when it reports none, which is different from low --
+    #: and 1.0 once a human has approved it.
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: What Document Intelligence originally scored, kept once approval
+    #: raises ``confidence`` to 1.0. Without it the report could no longer
+    #: show how well the machine actually read the document.
+    original_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
     #: The raw text as it appeared on the page, before Azure normalised it.
     content: str | None = None
@@ -95,8 +100,11 @@ class ExtractedField(BaseModel):
     #: Intelligence reports no spatial data for this field.
     bounding_regions: list[BoundingRegion] = Field(default_factory=list)
 
-    #: True once a reviewer changed the value at the approval step.
+    #: True once a reviewer changed the value.
     edited: bool = False
+
+    #: True once a human approved the value, whether or not they changed it.
+    verified: bool = False
 
     @property
     def pages(self) -> list[int]:
@@ -140,6 +148,80 @@ class ExtractionResult(BaseModel):
             if name not in known
         ]
         return self.model_copy(update={"fields": kept + added})
+
+    def merge_edits(self, edits: dict[str, Any]) -> ExtractionResult:
+        """Return a copy with ``edits`` applied over the existing fields.
+
+        Two differences from :meth:`apply_edits`:
+
+        * Fields absent from ``edits`` are **kept**. The correction step sends
+          only part of the record, so replacing the whole set would silently
+          delete everything the reviewer left alone.
+        * Every field in ``edits`` is marked verified, **whether or not the
+          value changed**. Submitting a value at the correction gate is the
+          reviewer saying they have checked it. Requiring a change would trap
+          a low-confidence value that happens to be correct: the only way to
+          clear it would be to alter it to something wrong and back again.
+        """
+        merged = [
+            field.model_copy(
+                update={
+                    "value": edits[field.name],
+                    "edited": edits[field.name] != field.value,
+                    "verified": True,
+                    "original_confidence": (
+                        field.original_confidence
+                        if field.original_confidence is not None
+                        else field.confidence
+                    ),
+                    "confidence": 1.0,
+                }
+            )
+            if field.name in edits
+            else field.model_copy()
+            for field in self.fields
+        ]
+        known = {field.name for field in self.fields}
+        added = [
+            ExtractedField(
+                name=name, value=value, edited=True, verified=True, confidence=1.0
+            )
+            for name, value in edits.items()
+            if name not in known
+        ]
+        return self.model_copy(update={"fields": merged + added})
+
+    def confidences(self) -> dict[str, float | None]:
+        """Per-field confidence scores, for the confidence check."""
+        return {field.name: field.confidence for field in self.fields}
+
+    def mark_verified(self) -> ExtractionResult:
+        """Return a copy with every field approved at full confidence.
+
+        Once a human has looked at the data and approved it, the machine's
+        confidence in its own reading is no longer the measure that matters --
+        the values carry a person's sign-off. The original scores are kept in
+        ``original_confidence`` so the report can still show how well the
+        extraction did.
+        """
+        return self.model_copy(
+            update={
+                "fields": [
+                    field.model_copy(
+                        update={
+                            "original_confidence": (
+                                field.original_confidence
+                                if field.original_confidence is not None
+                                else field.confidence
+                            ),
+                            "confidence": 1.0,
+                            "verified": True,
+                        }
+                    )
+                    for field in self.fields
+                ]
+            }
+        )
 
     @property
     def edited_field_names(self) -> list[str]:

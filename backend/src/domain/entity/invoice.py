@@ -16,7 +16,12 @@ from typing import Any
 
 from pydantic import Field, computed_field, field_validator, model_validator
 
-from domain.entity.common import EntityModel, currency_of, to_decimal
+from domain.entity.common import (
+    EntityModel,
+    currency_of,
+    to_date,
+    to_decimal,
+)
 
 __all__ = ["LineItem", "Invoice"]
 
@@ -60,6 +65,7 @@ class Invoice(EntityModel):
     _money = field_validator(
         "invoice_total", "subtotal", "total_tax", "amount_due", mode="before"
     )(to_decimal)
+    _dates = field_validator("invoice_date", "due_date", mode="before")(to_date)
 
     @model_validator(mode="before")
     @classmethod

@@ -66,19 +66,18 @@ class DocumentState(BaseModel):
     approval: ApprovalDecision | None = None
 
     #: What Document Intelligence extracted, each field with its confidence.
-    #: After the review step, values are the reviewer's finalised ones.
+    #: Corrections are merged back into it, so this is the single source of
+    #: truth for the document's data and what the checkpoint carries forward.
     extraction: ExtractionResult | None = None
     extraction_review: ExtractionReview | None = None
 
     #: What validation found, and the enrichment that followed it.
     validation: ValidationResult | None = None
 
-    #: Values a reviewer supplied for required fields the extraction missed.
-    completed_fields: dict[str, Any] = Field(default_factory=dict)
-
-    #: Set when a reviewer chose to continue despite fields still missing,
-    #: so the graph does not ask again in a loop.
-    skip_completion: bool = False
+    #: Set when a reviewer gave up on fixing the data and chose to end the
+    #: run anyway. Without an escape a document that cannot be corrected --
+    #: a total genuinely absent from the paper -- would loop forever.
+    abandon_correction: bool = False
 
     #: Id of the entity written to Cosmos DB.
     entity_id: str | None = None

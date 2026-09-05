@@ -131,9 +131,12 @@ class FakeAnalysisService(IDocumentAnalysisService):
     ) -> None:
         self.text = text
         self.call_count = 0
+        # A clean document by default: every score is above the 0.80
+        # threshold, so validation passes and the run flows through. Tests
+        # that want the correction loop pass their own low-scoring fields.
         self.fields = fields if fields is not None else [
             ExtractedField(name="InvoiceId", value="INV-123", confidence=0.97),
-            ExtractedField(name="InvoiceTotal", value=500.0, confidence=0.62),
+            ExtractedField(name="InvoiceTotal", value=500.0, confidence=0.91),
             ExtractedField(name="VendorName", value="Acme", confidence=None),
         ]
         self.fail_extract = fail_extract

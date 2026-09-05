@@ -5,12 +5,13 @@ for human approval when it is unsure, and stores the result.
 
 ```
 classify -> human_approval -> extract -> extraction_review -> validate
-                                                                 |
-                    +--> complete_fields <--(missing required)---+
-                    |          |                                 |
-                    +----------+                          (complete)
-                                                                 |
-                                        save <-- enrich <--------+
+                                                                 ^  |
+                                    correct_data <--(failed)-----+  |
+                                         |                          |
+                                         +--------------------------+
+                                                                 (passed)
+                                                                    |
+                                        save <-- enrich <-----------+
 ```
 
 Four agents:
@@ -19,7 +20,7 @@ Four agents:
 |---|---|---|
 | 1 Classifier | `classify` | Azure OpenAI vision over the rendered first page, falling back to Document Intelligence `prebuilt-read` text |
 | 2 Extraction | `extract` | Runs the Document Intelligence model for the approved type |
-| 3 Validation & Enrichment | `validate`, `complete_fields`, `enrich` | Checks the data against the entity schema, then standardises and summarises it with Azure OpenAI |
+| 3 Validation & Enrichment | `validate`, `correct_data`, `enrich` | Checks the data against the entity schema, then standardises and summarises it with Azure OpenAI |
 | 4 Output & Storage | `save` | Stores the entity in Cosmos DB, and the output plus processing report in Blob Storage |
 
 A failure in any node routes to `error_handler`.
@@ -32,12 +33,23 @@ Each gates something different:
 |---|---|
 | `human_approval` | Only when the classification is doubtful — below `CONFIDENCE_THRESHOLD`, or type `unsupported` |
 | `extraction_review` | **Always.** The reviewer is signing off the data itself, and may edit it first |
-| `complete_fields` | Only when the schema requires a field the extraction could not supply |
+| `correct_data` | Whenever **any** validation check fails. Loops until they all pass |
 
-`complete_fields` loops back through `validate`, so supplied values are checked
-like any others. A reviewer who cannot supply a value can tick *continue
-regardless* — the run finishes and the output is saved, but no entity is
-stored, because the data never validated.
+**Nothing is stored until validation passes.** A failing check — a missing
+required field, money that does not add up, or a value Azure was not confident
+about — sends the run back to `correct_data`. The reviewer's corrections are
+merged into the extraction, so the checkpoint carries the corrected data
+forward and the next pass validates *that*, not the original values. The loop
+repeats until every check passes.
+
+A field a human edits counts as verified, so its original confidence no longer
+counts against it. Without that a low-confidence field could never be cleared —
+editing a value does not change Azure's score for it — and the loop would never
+end.
+
+A reviewer can tick *cannot fix this* to end a run whose data genuinely cannot
+be corrected. The output and report are still written, but no entity is stored,
+because the data never validated.
 
 ### Extraction
 

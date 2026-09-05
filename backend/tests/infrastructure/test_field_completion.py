@@ -34,13 +34,13 @@ PNG = b"\x89PNG\r\n\x1a\n fake"
 COMPLETE = [
     ExtractedField(name="VendorName", value="Acme", confidence=0.92),
     ExtractedField(name="InvoiceId", value="INV-1", confidence=0.98),
-    ExtractedField(name="InvoiceTotal", value=495.0, confidence=0.44),
+    ExtractedField(name="InvoiceTotal", value=495.0, confidence=0.88),
 ]
 
 #: Same document with the vendor unreadable -- the case that needs a human.
 MISSING_VENDOR = [
     ExtractedField(name="InvoiceId", value="INV-1", confidence=0.98),
-    ExtractedField(name="InvoiceTotal", value=495.0, confidence=0.44),
+    ExtractedField(name="InvoiceTotal", value=495.0, confidence=0.88),
 ]
 
 
@@ -117,8 +117,8 @@ class TestCompleteDataFlowsStraightThrough:
         assert stored["entity"]["invoice_id"] == "INV-1"
 
 
-class TestMissingFieldCheckpoint:
-    """A required field the extraction could not read pauses for a human."""
+class TestCorrectionLoop:
+    """Any validation failure sends the run back to a human."""
 
     def test_pauses_and_names_the_missing_field(self, settings: Settings) -> None:
         workflow, storage, _ = build(settings, MISSING_VENDOR)
@@ -128,7 +128,7 @@ class TestMissingFieldCheckpoint:
         result = workflow.graph.invoke(Command(resume={"approved": True}), run)
 
         payload = result["__interrupt__"][0].value
-        assert payload["stage"] == "field_completion"
+        assert payload["stage"] == "data_correction"
         assert payload["missing_fields"] == ["vendor_name"]
         # Nothing stored while the data is still incomplete.
         assert storage.uploads == []
@@ -146,8 +146,10 @@ class TestMissingFieldCheckpoint:
         assert payload["document_type"] == "invoice"
         # The data as it stands, so the reviewer is not working blind.
         assert payload["current"]["InvoiceId"] == "INV-1"
-        # Low-confidence fields are surfaced at the same time.
-        assert "InvoiceTotal" in payload["low_confidence_fields"]
+        # And why it came back, so they know what to fix.
+        assert any(
+            check["field"] == "vendor_name" for check in payload["failed_checks"]
+        )
 
     def test_supplying_the_value_completes_the_run(
         self, settings: Settings
@@ -183,19 +185,23 @@ class TestMissingFieldCheckpoint:
         # A reviewer who supplies nothing useful is asked again.
         result = workflow.graph.invoke(Command(resume={"fields": {}}), run)
 
-        assert result["__interrupt__"][0].value["stage"] == "field_completion"
+        assert result["__interrupt__"][0].value["stage"] == "data_correction"
 
-    def test_reviewer_can_choose_to_continue_regardless(
+    def test_reviewer_can_abandon_an_uncorrectable_document(
         self, settings: Settings
     ) -> None:
-        """Without this the graph would ask, be refused, and ask forever."""
+        """An escape for data that genuinely cannot be fixed.
+
+        Without it a document whose total is simply absent from the paper
+        would loop forever.
+        """
         workflow, storage, entities = build(settings, MISSING_VENDOR)
         run = config("skip")
         start(workflow, run)
         workflow.graph.invoke(Command(resume={"approved": True}), run)
 
         result = workflow.graph.invoke(
-            Command(resume={"skip": True, "reviewer": "naveen"}), run
+            Command(resume={"abandon": True, "reviewer": "naveen"}), run
         )
 
         assert "__interrupt__" not in result
@@ -224,9 +230,9 @@ class TestMissingFieldCheckpoint:
             AgentName.HUMAN_APPROVAL,
             AgentName.EXTRACTOR,
             AgentName.EXTRACTION_REVIEW,
-            AgentName.VALIDATOR,        # found the gap
-            AgentName.FIELD_COMPLETION, # asked a human
-            AgentName.VALIDATOR,        # checked the answer
+            AgentName.VALIDATOR,       # found the problem
+            AgentName.DATA_CORRECTION, # asked a human
+            AgentName.VALIDATOR,       # checked the correction
             AgentName.ENRICHER,
             AgentName.SAVE,
         ]
@@ -273,8 +279,13 @@ class TestReportSections:
         # 2: extraction summary with field-level confidence
         assert report["extraction"]["model_id"] == "prebuilt-invoice"
         assert report["extraction"]["field_count"] == 3
-        scores = {f["name"]: f["confidence"] for f in report["extraction"]["fields"]}
-        assert scores["InvoiceTotal"] == pytest.approx(0.44)
+        # The report reports what the machine read, not the 1.0 that approval
+        # confers -- otherwise it would claim every extraction was flawless.
+        scores = {
+            f["name"]: f["original_confidence"]
+            for f in report["extraction"]["fields"]
+        }
+        assert scores["InvoiceTotal"] == pytest.approx(0.88)
         # Weakest first, so a reviewer reads the doubtful values at the top.
         assert report["extraction"]["fields"][0]["name"] == "InvoiceTotal"
 
@@ -282,6 +293,7 @@ class TestReportSections:
         assert report["validation"]["total_checks"] > 0
         assert isinstance(report["validation"]["passed"], bool)
 
-        # 4: anything flagged for review
-        assert report["review"]["low_confidence_fields"] == ["InvoiceTotal"]
+        # 4: anything flagged for review -- nothing here, since a clean
+        # document is now the only kind that reaches save.
+        assert report["review"]["low_confidence_fields"] == []
         assert report["entity_id"] == "doc-1"

@@ -40,7 +40,7 @@ STATUS_COLOURS = {
     "validated": "green",
     "awaiting_approval": "orange",
     "awaiting_extraction_review": "orange",
-    "awaiting_field_completion": "orange",
+    "awaiting_data_correction": "orange",
     "classified": "blue",
     "extracted": "blue",
     "rejected": "red",
@@ -91,7 +91,7 @@ def submit_approval(
     approved: bool,
     document_type: str | None = None,
     fields: dict | None = None,
-    skip: bool = False,
+    abandon: bool = False,
     reviewer: str | None = None,
     note: str | None = None,
 ) -> dict:
@@ -106,7 +106,7 @@ def submit_approval(
             "approved": approved,
             "document_type": document_type,
             "fields": fields,
-            "skip": skip,
+            "abandon": abandon,
             "reviewer": reviewer or None,
             "note": note or None,
         },
@@ -157,8 +157,8 @@ def render_approval(api_url: str, result: dict) -> None:
     if request.get("stage") == "extraction":
         render_extraction_review(api_url, result, request)
         return
-    if request.get("stage") == "field_completion":
-        render_field_completion(api_url, result, request)
+    if request.get("stage") == "data_correction":
+        render_data_correction(api_url, result, request)
         return
 
     st.warning("The classifier was not confident enough, so the run paused here.")
@@ -248,7 +248,9 @@ def render_extraction_review(api_url: str, result: dict, request: dict) -> None:
             num_rows="dynamic",
             column_config={
                 "field": st.column_config.TextColumn("Field"),
-                "value": st.column_config.TextColumn("Value"),
+                "value": st.column_config.TextColumn(
+                    "Value", help="Dates: use YYYY-MM-DD."
+                ),
                 "confidence": st.column_config.ProgressColumn(
                     "Confidence",
                     help=(
@@ -292,47 +294,101 @@ def render_extraction_review(api_url: str, result: dict, request: dict) -> None:
     st.rerun()
 
 
-def render_field_completion(api_url: str, result: dict, request: dict) -> None:
-    """Ask the reviewer for required fields the extraction could not read."""
-    missing = list(request.get("missing_fields") or [])
+def render_data_correction(api_url: str, result: dict, request: dict) -> None:
+    """Show what failed validation and let the reviewer correct the data.
 
-    st.error(
-        f"The {request.get('document_type')} schema requires "
-        f"{len(missing)} field(s) the extraction could not read."
+    Nothing is stored until validation passes, so this reopens on every
+    failed attempt with the latest values already filled in.
+    """
+    failures = request.get("failed_checks") or []
+    st.error(f"Validation failed: {len(failures)} check(s) did not pass.")
+    for check in failures:
+        st.markdown(f"- **{check.get('name')}** — {check.get('message')}")
+
+    fields = request.get("fields") or []
+    missing = set(request.get("missing_fields") or [])
+    originals = {field["name"]: field.get("value") for field in fields}
+
+    table = pd.DataFrame(
+        [
+            {
+                "field": field["name"],
+                "value": _to_cell(field.get("value")),
+                "confidence": field.get("confidence"),
+                "edited": bool(field.get("edited")),
+            }
+            for field in fields
+        ]
     )
 
-    for message in request.get("failed_checks") or []:
-        st.caption(f"· {message}")
+    st.caption(
+        "Edit any value and submit. A value you edit counts as verified, so "
+        "its original confidence no longer blocks the document."
+    )
 
-    with st.form("completion_form"):
-        supplied: dict[str, str] = {}
-        for name in missing:
-            supplied[name] = st.text_input(name, key=f"missing_{name}")
+    with st.form("correction_form"):
+        edited = st.data_editor(
+            table,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "field": st.column_config.TextColumn("Field"),
+                "value": st.column_config.TextColumn("Value"),
+                "confidence": st.column_config.ProgressColumn(
+                    "Confidence", min_value=0.0, max_value=1.0, format="%.2f"
+                ),
+                "edited": st.column_config.CheckboxColumn("Edited"),
+            },
+            disabled=["confidence", "edited"],
+        )
+
+        # Required fields the extraction never produced have no row to edit.
+        supplied: dict[str, Any] = {}
+        for name in sorted(missing):
+            if name in originals:
+                continue
+            label = f"{name} (required, not found in the document)"
+            if _is_date_field(name, None):
+                # A picker rather than free text, so the value always leaves
+                # as ISO 8601 and never has to be guessed at.
+                chosen = st.date_input(
+                    label, value=None, format="YYYY-MM-DD", key=f"missing_{name}"
+                )
+                supplied[name] = chosen.isoformat() if chosen else ""
+            else:
+                supplied[name] = st.text_input(label, key=f"missing_{name}")
+
+        date_rows = [
+            field["name"]
+            for field in fields
+            if _is_date_field(field["name"], field.get("value"))
+        ]
+        if date_rows:
+            st.caption(
+                "Dates in the table (" + ", ".join(date_rows) + ") are read as "
+                "**YYYY-MM-DD**. Other formats are accepted, but a slash date "
+                "like 01/02/2003 is read day-first."
+            )
 
         reviewer = st.text_input("Your name (optional)")
-        skip = st.checkbox(
-            "Continue without these fields",
+        abandon = st.checkbox(
+            "Cannot fix this — end the run",
             help=(
-                "The run finishes and the output is saved, but no validated "
-                "entity is stored, because the data is incomplete."
+                "The run finishes and the output is recorded, but no entity "
+                "is stored, because the data never validated."
             ),
         )
         submitted = st.form_submit_button(
-            "Submit", type="primary", use_container_width=True
+            "Submit corrections", type="primary", use_container_width=True
         )
-
-    with st.expander("Data extracted so far"):
-        st.json(request.get("current") or {})
 
     if not submitted:
         return
 
-    filled = {name: value for name, value in supplied.items() if value.strip()}
-    if not filled and not skip:
-        st.warning(
-            "Fill in at least one field, or tick 'Continue without these fields'."
-        )
-        return
+    corrections = _rows_to_json(edited, originals)
+    corrections.update(
+        {name: value.strip() for name, value in supplied.items() if value.strip()}
+    )
 
     with st.spinner("Re-validating..."):
         try:
@@ -340,14 +396,42 @@ def render_field_completion(api_url: str, result: dict, request: dict) -> None:
                 api_url,
                 result["document_id"],
                 approved=True,
-                fields=filled or None,
-                skip=skip,
+                fields=corrections or None,
+                abandon=abandon,
                 reviewer=reviewer,
             )
         except (RuntimeError, requests.RequestException) as exc:
             st.error(str(exc))
             return
     st.rerun()
+
+
+def _is_date_field(name: str, value: Any) -> bool:
+    """Whether a field should be edited as a date.
+
+    Dates get a picker rather than free text, so the value always leaves as
+    ISO 8601 -- "01/02/2003" is otherwise ambiguous between day-first and
+    month-first, and guessing wrong silently stores the wrong date.
+    """
+    if not name.lower().endswith("date"):
+        return False
+    if value in (None, ""):
+        return True
+    return _parse_iso_date(value) is not None
+
+
+def _parse_iso_date(value: Any):
+    """Parse an ISO date, or return None."""
+    from datetime import date, datetime
+
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
 
 
 def _to_cell(value: Any) -> str:
@@ -420,11 +504,13 @@ def render_result(result: dict) -> None:
     if result.get("summary"):
         st.info(result["summary"])
 
-    if result.get("missing_fields"):
+    checks_failed = [
+        c for c in (result.get("validation_checks") or []) if not c["passed"]
+    ]
+    if checks_failed and not result.get("entity"):
         st.warning(
-            "Saved without required field(s): "
-            + ", ".join(result["missing_fields"])
-            + " -- no entity was stored."
+            "Recorded without a validated entity: "
+            f"{len(checks_failed)} check(s) still failing."
         )
 
     entity = result.get("entity")
@@ -453,7 +539,12 @@ def render_result(result: dict) -> None:
                     {
                         "field": field["name"],
                         "value": _to_cell(field.get("value")),
-                        "confidence": field.get("confidence"),
+                        "confidence": (
+                            field.get("original_confidence")
+                            if field.get("original_confidence") is not None
+                            else field.get("confidence")
+                        ),
+                        "verified": bool(field.get("verified")),
                         "edited": bool(field.get("edited")),
                     }
                     for field in fields
@@ -462,8 +553,17 @@ def render_result(result: dict) -> None:
             hide_index=True,
             column_config={
                 "confidence": st.column_config.ProgressColumn(
-                    "Confidence", min_value=0.0, max_value=1.0, format="%.2f"
+                    "Extraction confidence",
+                    help=(
+                        "What Document Intelligence scored. Approved values "
+                        "are stored at 100%; this shows how well the machine "
+                        "actually read them."
+                    ),
+                    min_value=0.0,
+                    max_value=1.0,
+                    format="%.2f",
                 ),
+                "verified": st.column_config.CheckboxColumn("Approved"),
                 "edited": st.column_config.CheckboxColumn("Edited"),
             },
         )

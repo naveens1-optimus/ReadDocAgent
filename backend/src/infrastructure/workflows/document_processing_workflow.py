@@ -1,12 +1,13 @@
 """The LangGraph pipeline -- four agents, three human checkpoints.
 
     classify -> human_approval -> extract -> extraction_review -> validate
-                                                                     |
-                        +--> complete_fields <--(missing required)---+
-                        |          |                                 |
-                        +----------+                          (complete)
-                                                                     |
-                                            save <-- enrich <--------+
+                                                                     ^  |
+                                        correct_data <--(failed)-----+  |
+                                             |                          |
+                                             +--------------------------+
+                                                                     (passed)
+                                                                        |
+                                            save <-- enrich <-----------+
 
 Agents:
 
@@ -25,10 +26,18 @@ Human checkpoints, each gating something different:
 * ``extraction_review`` confirms *the data*. Always pauses -- the reviewer is
                         signing off the values that get saved, and may edit
                         them first.
-* ``complete_fields``   asks only when the schema requires a field the
-                        extraction could not supply. It loops back through
-                        validation, so supplied values are checked like any
-                        others.
+* ``correct_data``      opens whenever validation fails -- a missing required
+                        field, money that does not add up, or a value Azure
+                        was not confident about. The reviewer's corrections
+                        are merged into the extraction and validated again,
+                        looping until they pass. Nothing is stored until they
+                        do, so a document that needs work simply stays paused
+                        in the checkpoint.
+
+                        A field a human edits is treated as verified, so its
+                        original confidence score no longer counts against
+                        it -- otherwise a low-confidence field could never be
+                        cleared and the loop would never end.
 
 A failure in any node routes to ``error_handler``.
 """
@@ -157,7 +166,7 @@ class DocumentProcessingWorkflow:
             },
         )
         builder.add_node(AgentName.VALIDATOR.value, self._validate)
-        builder.add_node(AgentName.FIELD_COMPLETION.value, self._complete_fields)
+        builder.add_node(AgentName.DATA_CORRECTION.value, self._correct_data)
         builder.add_node(AgentName.ENRICHER.value, self._enrich)
 
         builder.add_conditional_edges(
@@ -172,13 +181,13 @@ class DocumentProcessingWorkflow:
             AgentName.VALIDATOR.value,
             self._route_after_validate,
             {
-                "complete": AgentName.FIELD_COMPLETION.value,
+                "correct": AgentName.DATA_CORRECTION.value,
                 "enrich": AgentName.ENRICHER.value,
             },
         )
-        # Back to validation, so the values a reviewer supplied are checked
-        # like any others rather than trusted blindly.
-        builder.add_edge(AgentName.FIELD_COMPLETION.value, AgentName.VALIDATOR.value)
+        # Back to validation. The loop is the point: corrections are checked
+        # like any other data, and nothing is stored until they pass.
+        builder.add_edge(AgentName.DATA_CORRECTION.value, AgentName.VALIDATOR.value)
         builder.add_edge(AgentName.ENRICHER.value, AgentName.SAVE.value)
         builder.add_edge(AgentName.SAVE.value, END)
         builder.add_edge(AgentName.ERROR_HANDLER.value, END)
@@ -395,6 +404,12 @@ class DocumentProcessingWorkflow:
         )
         approved = bool(answer.get("approved", False))
 
+        # Approving is a sign-off on every value shown, so each field becomes
+        # human-verified at full confidence. Azure's own scores are kept in
+        # original_confidence for the report.
+        if approved:
+            final = final.mark_verified()
+
         review = ExtractionReview(
             approved=approved,
             reviewer=answer.get("reviewer"),
@@ -429,11 +444,10 @@ class DocumentProcessingWorkflow:
         assert state.classification is not None
         assert state.extraction is not None
 
-        # Anything a reviewer filled in earlier takes part in validation.
-        data = {**state.extraction.to_json(), **state.completed_fields}
-        confidences = {
-            field.name: field.confidence for field in state.extraction.fields
-        }
+        # The extraction is the single source of truth: corrections were
+        # merged back into it, so this is always the current data.
+        data = state.extraction.to_json()
+        confidences = state.extraction.confidences()
 
         try:
             result = self._validator.validate(
@@ -469,14 +483,21 @@ class DocumentProcessingWorkflow:
             ],
         }
 
-    def _complete_fields(self, state: DocumentState) -> dict[str, Any]:
-        """Ask a reviewer to supply the required fields extraction missed."""
+    def _correct_data(self, state: DocumentState) -> dict[str, Any]:
+        """Show the reviewer what failed validation and take their corrections.
+
+        The corrections are merged **into the extraction**, so the checkpoint
+        carries the corrected data forward and the next validation pass reads
+        it rather than the original extracted values.
+        """
         validation = state.validation
+        extraction = state.extraction
         assert validation is not None
+        assert extraction is not None
 
         answer = interrupt(
             {
-                "stage": "field_completion",
+                "stage": "data_correction",
                 "document_id": state.document_id,
                 "file_name": state.file_name,
                 "document_type": (
@@ -484,37 +505,49 @@ class DocumentProcessingWorkflow:
                     if state.classification
                     else None
                 ),
+                # Why it came back, so the reviewer knows what to fix.
+                "failed_checks": [
+                    {
+                        "name": check.name,
+                        "category": check.category,
+                        "message": check.message,
+                        "field": check.field,
+                    }
+                    for check in validation.failed_checks
+                ],
                 "missing_fields": validation.missing_fields,
                 "low_confidence_fields": validation.low_confidence_fields,
-                "failed_checks": [
-                    check.message for check in validation.failed_checks
+                # The data as it currently stands, including earlier
+                # corrections, so each pass starts from the latest values.
+                "fields": [
+                    field.model_dump(mode="json") for field in extraction.fields
                 ],
-                # The data as it stands, so the reviewer has context.
-                "current": (
-                    state.extraction.to_json() if state.extraction else {}
-                ),
+                "current": extraction.to_json(),
             }
         )
 
         answer = answer or {}
-        supplied = answer.get("fields") or {}
-        skip = bool(answer.get("skip"))
+        edits = answer.get("fields") or {}
+        abandon = bool(answer.get("abandon") or answer.get("skip"))
 
+        corrected = extraction.merge_edits(edits) if edits else extraction
         logger.info(
-            "Reviewer supplied %s field(s)%s",
-            len(supplied),
-            " and chose to continue regardless" if skip else "",
+            "Reviewer corrected %s field(s)%s",
+            len(edits),
+            " and abandoned the correction" if abandon else "",
         )
         return {
-            "completed_fields": {**state.completed_fields, **supplied},
-            "skip_completion": skip,
+            # Merged back in, so validation re-runs against the corrections.
+            "extraction": corrected,
+            "abandon_correction": abandon,
+            "status": ProcessingStatus.AWAITING_DATA_CORRECTION,
             "audit_trail": [
                 AuditEntry.record(
-                    AgentName.FIELD_COMPLETION,
-                    "complete_fields",
-                    supplied=sorted(supplied),
+                    AgentName.DATA_CORRECTION,
+                    "correct_data",
+                    corrected=sorted(edits),
                     reviewer=answer.get("reviewer"),
-                    skipped=skip,
+                    abandoned=abandon,
                 )
             ],
         }
@@ -525,10 +558,9 @@ class DocumentProcessingWorkflow:
         assert validation is not None
         assert state.classification is not None
 
-        data = validation.entity or {
-            **(state.extraction.to_json() if state.extraction else {}),
-            **state.completed_fields,
-        }
+        data = validation.entity or (
+            state.extraction.to_json() if state.extraction else {}
+        )
         summary, enriched, error = self._validator.enrich(
             state.classification.document_type, data
         )
@@ -571,9 +603,15 @@ class DocumentProcessingWorkflow:
         validation = state.validation
 
         # The validated entity goes to Cosmos, keyed on the document id.
-        # Only for an approved run with a complete entity -- there is no point
-        # storing business data a reviewer rejected.
-        if approved and validation is not None and validation.entity is not None:
+        # Only when validation actually passed: a run that reached save by
+        # being abandoned still has failing checks, and storing that data
+        # would defeat the point of validating it.
+        if (
+            approved
+            and validation is not None
+            and validation.entity is not None
+            and validation.passed
+        ):
             try:
                 entity_id = self._entities.save(
                     document_id=state.document_id,
@@ -731,17 +769,22 @@ class DocumentProcessingWorkflow:
 
     @staticmethod
     def _route_after_validate(state: DocumentState) -> str:
-        """Ask a human for anything required that is still missing.
+        """Nothing is stored until validation passes.
 
-        The reviewer can also choose to continue regardless, which sets
-        ``skip_completion`` -- without it the graph would ask, be answered
-        incompletely, and ask again forever.
+        *Any* failing check sends the run back to a human -- a missing
+        required field, money that does not add up, or a value Azure was not
+        confident about. Previously only missing fields did, so a document
+        with a failed arithmetic or confidence check was saved anyway, which
+        defeated the point of validating it.
+
+        The reviewer can abandon a document that genuinely cannot be fixed;
+        that ends the run without storing an entity.
         """
         validation = state.validation
         if validation is None or state.error:
             return "enrich"
-        if validation.missing_fields and not state.skip_completion:
-            return "complete"
+        if not validation.passed and not state.abandon_correction:
+            return "correct"
         return "enrich"
 
 
