@@ -6,7 +6,7 @@ worker thread -- the Azure SDK clients underneath are synchronous.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
 from pydantic import ValidationError
 
 from application.handler.process_document_handler import (
@@ -46,8 +46,8 @@ def _get_handler(request: Request) -> ProcessDocumentHandler:
     description=(
         "Stores the document in Blob Storage and runs the LangGraph pipeline: "
         "classify, then the human approval checkpoint, then save.\n\n"
-        "Omit `session_id` on the first upload and the API generates one; send "
-        "it back on later uploads to keep them in the same session.\n\n"
+        "Returns a `document_id` -- the identifier for this run, used to poll "
+        "status and to submit an approval.\n\n"
         "If the classifier is confident the run completes immediately. If not, "
         "the response has `awaiting_approval: true` with an `approval_request` "
         "payload -- send the decision to "
@@ -55,11 +55,7 @@ def _get_handler(request: Request) -> ProcessDocumentHandler:
     ),
 )
 def upload_document(
-    request: Request,
-    file: UploadFile = File(...),
-    session_id: str | None = Form(
-        default=None, description="Omit on the first upload; the API returns one."
-    ),
+    request: Request, file: UploadFile = File(...)
 ) -> ProcessDocumentResponse:
     """Accept a PDF or image and run it through the pipeline."""
     handler = _get_handler(request)
@@ -77,7 +73,7 @@ def upload_document(
         ) from exc
 
     try:
-        return handler.handle(upload, data, session_id=session_id or None)
+        return handler.handle(upload, data)
     except ValueError as exc:  # size limit
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)

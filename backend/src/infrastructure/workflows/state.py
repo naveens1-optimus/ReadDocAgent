@@ -36,11 +36,6 @@ class DocumentState(BaseModel):
 
     # --- Input ---
     document_id: str
-
-    #: The user session this document was uploaded in. Several documents can
-    #: share a session; each still gets its own isolated run.
-    session_id: str
-
     file_name: str
     content_type: str | None = None
     extension: str = ""
@@ -69,7 +64,6 @@ class DocumentState(BaseModel):
         """Compact view of the run, for logs and API responses."""
         return {
             "document_id": self.document_id,
-            "session_id": self.session_id,
             "file_name": self.file_name,
             "status": self.status.value,
             "document_type": (

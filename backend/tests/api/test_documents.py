@@ -105,7 +105,6 @@ class TestUpload:
         assert body["confidence"] == pytest.approx(0.94)
         assert body["awaiting_approval"] is False
         assert body["document_id"]
-        assert body["session_id"]
 
     def test_stores_the_input_document_and_the_result(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
@@ -272,80 +271,47 @@ class TestStatus:
         assert harness.client.get("/documents/nope").status_code == 404
 
 
-class TestSessions:
-    """A session groups uploads; each document still runs in isolation."""
+class TestDocumentsAreIndependent:
+    """Each upload is its own run, keyed on its own document id."""
 
-    def test_api_generates_a_session_id_on_first_upload(self, make_harness) -> None:
-        harness = make_harness(CONFIDENT)
-
-        body = upload(harness.client).json()
-
-        assert body["session_id"]
-
-    def test_supplied_session_id_is_reused(self, make_harness) -> None:
-        harness = make_harness(CONFIDENT)
-        first = upload(harness.client).json()
-
-        second = harness.client.post(
-            "/documents",
-            files={"file": ("second.png", PNG_BYTES, "image/png")},
-            data={"session_id": first["session_id"]},
-        ).json()
-
-        assert second["session_id"] == first["session_id"]
-        assert second["document_id"] != first["document_id"]
-
-    def test_separate_uploads_get_separate_sessions_by_default(
-        self, make_harness
-    ) -> None:
+    def test_uploads_get_distinct_document_ids(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
 
         first = upload(harness.client).json()
         second = upload(harness.client, name="other.png").json()
 
-        assert first["session_id"] != second["session_id"]
+        assert first["document_id"] != second["document_id"]
 
-    def test_blobs_are_grouped_under_the_session(self, make_harness) -> None:
+    def test_blobs_are_grouped_under_the_document(self, make_harness) -> None:
         harness = make_harness(CONFIDENT)
 
         body = upload(harness.client).json()
 
         for item in harness.storage.uploads:
-            assert item["blob_name"].startswith(
-                f"{body['session_id']}/{body['document_id']}/"
-            )
+            assert item["blob_name"].startswith(f"{body['document_id']}/")
 
-    def test_two_documents_in_one_session_stay_isolated(
-        self, make_harness
-    ) -> None:
-        """The second upload must not clobber an approval pending on the first.
-
-        Both documents share a session, so this is the case that a single
-        shared graph thread would break.
-        """
+    def test_two_pending_approvals_do_not_interfere(self, make_harness) -> None:
+        """Resolving one paused document must leave the other untouched."""
         harness = make_harness(UNSURE)
-        first = upload(harness.client).json()
-        assert first["awaiting_approval"] is True
 
-        second = harness.client.post(
-            "/documents",
-            files={"file": ("second.png", PNG_BYTES, "image/png")},
-            data={"session_id": first["session_id"]},
-        ).json()
+        first = upload(harness.client).json()
+        second = upload(harness.client, name="second.png").json()
+        assert first["awaiting_approval"] is True
         assert second["awaiting_approval"] is True
 
-        # The first is still paused and independently resumable.
-        still_pending = harness.client.get(
-            f"/documents/{first['document_id']}"
-        ).json()
-        assert still_pending["status"] == "awaiting_approval"
-
         done = harness.client.post(
-            f"/documents/{first['document_id']}/approval",
-            json={"approved": True},
+            f"/documents/{first['document_id']}/approval", json={"approved": True}
         ).json()
         assert done["status"] == "completed"
 
-        # Resolving the first left the second untouched.
         other = harness.client.get(f"/documents/{second['document_id']}").json()
         assert other["status"] == "awaiting_approval"
+
+    def test_response_has_no_session_field(self, make_harness) -> None:
+        """document_id is the only identifier the API exposes."""
+        harness = make_harness(CONFIDENT)
+
+        body = upload(harness.client).json()
+
+        assert "session_id" not in body
+        assert "thread_id" not in body

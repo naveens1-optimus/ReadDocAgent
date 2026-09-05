@@ -41,45 +41,31 @@ class ProcessDocumentHandler:
         self._settings = settings
 
     def handle(
-        self,
-        upload: UploadFileRequest,
-        data: bytes,
-        session_id: str | None = None,
+        self, upload: UploadFileRequest, data: bytes
     ) -> ProcessDocumentResponse:
         """Store the document, then run the graph until it finishes or pauses.
-
-        Args:
-            upload: Validated upload metadata.
-            data: The raw file bytes.
-            session_id: The caller's session. A new one is generated when
-                omitted, which is how a client gets its first session id.
 
         Raises:
             ValueError: If the file exceeds the configured size limit.
         """
         upload.ensure_within_size_limit(self._settings.app.max_upload_size_bytes)
 
-        session_id = session_id or new_session_id()
         document_id = uuid4().hex
 
         with correlation_id_scope(document_id):
             logger.info(
-                "Processing %s (%s bytes) in session %s",
-                upload.file_name,
-                upload.size_bytes,
-                session_id,
+                "Processing %s (%s bytes)", upload.file_name, upload.size_bytes
             )
 
             input_blob_url = self._storage.upload(
                 container=self._settings.blob_storage.input_container,
-                blob_name=f"{session_id}/{document_id}/{upload.file_name}",
+                blob_name=f"{document_id}/{upload.file_name}",
                 data=data,
                 content_type=upload.content_type,
             )
 
             initial_state = DocumentState(
                 document_id=document_id,
-                session_id=session_id,
                 file_name=upload.file_name,
                 content_type=upload.content_type,
                 extension=upload.extension,
@@ -136,19 +122,12 @@ class ProcessDocumentHandler:
         return snapshot
 
 
-def new_session_id() -> str:
-    """Create an identifier for a new user session."""
-    return uuid4().hex
-
-
 def _run_config(document_id: str) -> dict[str, Any]:
     """Config telling the checkpointer which run to read or resume.
 
-    Each document is its own LangGraph thread, keyed on the document id. A
-    session may contain several documents, and giving them one shared thread
-    would mean the second upload inherited the first's state -- the audit
-    trail uses an additive reducer -- and could clobber an approval still
-    pending on the first.
+    The document id is used directly as the LangGraph thread id: one document
+    is one run. ``thread_id`` is LangGraph's own term and stays confined to
+    this function -- nothing above it deals in threads.
     """
     return {"configurable": {"thread_id": document_id}}
 

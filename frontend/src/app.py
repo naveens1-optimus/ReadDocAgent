@@ -65,22 +65,11 @@ def check_readiness(api_url: str) -> tuple[bool, list[dict[str, Any]]]:
     return bool(body.get("ready")), body.get("components", [])
 
 
-def upload_document(
-    api_url: str,
-    name: str,
-    data: bytes,
-    content_type: str,
-    session_id: str | None,
-) -> dict:
-    """Upload a document and run it through the graph.
-
-    ``session_id`` is omitted on the first upload; the API generates one and
-    returns it, and we send it back on later uploads to keep them together.
-    """
+def upload_document(api_url: str, name: str, data: bytes, content_type: str) -> dict:
+    """Upload a document and run it through the graph."""
     response = requests.post(
         f"{api_url}/documents",
         files={"file": (name, data, content_type)},
-        data={"session_id": session_id} if session_id else None,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
     if not response.ok:
@@ -227,10 +216,7 @@ def render_result(result: dict) -> None:
     if result.get("error"):
         st.error(result["error"])
 
-    st.caption(
-        f"Session `{result.get('session_id', '')}` · "
-        f"document `{result.get('document_id', '')}`"
-    )
+    st.caption(f"Document id: `{result.get('document_id', '')}`")
 
 
 # ---------------------------------------------------------------------------
@@ -257,15 +243,12 @@ def main() -> None:
     if st.button("Upload & classify", type="primary", disabled=uploaded is None):
         with st.spinner("Storing and classifying..."):
             try:
-                result = upload_document(
+                st.session_state.result = upload_document(
                     api_url,
                     uploaded.name,
                     uploaded.getvalue(),
                     uploaded.type or "application/octet-stream",
-                    st.session_state.get("session_id"),
                 )
-                st.session_state.session_id = result["session_id"]
-                st.session_state.result = result
             except (RuntimeError, requests.RequestException) as exc:
                 st.session_state.result = None
                 st.error(str(exc))
