@@ -12,6 +12,7 @@ from langgraph.types import Command
 from domain.enum.document_type import DocumentType
 from domain.enum.processing_status import AgentName, ProcessingStatus
 from domain.schema.settings import Settings
+from infrastructure.agents.data_extraction_agent import DataExtractionAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -43,6 +44,7 @@ def make_workflow(
 
     workflow = DocumentProcessingWorkflow(
         classifier=DocumentClassificationAgent(language_model, analysis),
+        extractor=DataExtractionAgent(analysis),
         storage=storage,
         settings=settings,
         checkpointer=SqliteSaver(sqlite3.connect(":memory:", check_same_thread=False)),
@@ -65,47 +67,74 @@ def config_for(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
+def approve(workflow, config: dict, **answer) -> dict:
+    """Resume whichever checkpoint is currently open."""
+    return workflow.graph.invoke(
+        Command(resume={"approved": True, **answer}), config=config
+    )
+
+
 class TestConfidentClassification:
     """High confidence auto-approves and runs straight through."""
 
-    def test_completes_without_pausing(self, settings: Settings) -> None:
+    def test_auto_approves_then_pauses_on_the_data(
+        self, settings: Settings
+    ) -> None:
+        """Confidence skips the classification gate, never the extraction one."""
         workflow, _, storage = make_workflow(settings)
 
         result = workflow.graph.invoke(initial_state(), config=config_for("t1"))
 
-        assert "__interrupt__" not in result
+        assert result["__interrupt__"][0].value["stage"] == "extraction"
         state = DocumentState.model_validate(result)
-        assert state.status is ProcessingStatus.COMPLETED
         assert state.classification is not None
         assert state.classification.document_type is DocumentType.INVOICE
         assert state.approval is not None
-        assert state.approval.approved is True
         assert state.approval.auto_approved is True
+        assert storage.uploads == [], "must not save before the data is signed off"
+
+    def test_completes_after_the_extraction_is_approved(
+        self, settings: Settings
+    ) -> None:
+        workflow, _, storage = make_workflow(settings)
+        config = config_for("t1")
+        workflow.graph.invoke(initial_state(), config=config)
+
+        result = approve(workflow, config, reviewer="naveen")
+
+        state = DocumentState.model_validate(result)
+        assert state.status is ProcessingStatus.COMPLETED
         assert len(storage.uploads) == 1
 
     def test_saves_result_json_to_output_container(
         self, settings: Settings
     ) -> None:
         workflow, _, storage = make_workflow(settings)
+        config = config_for("t1")
+        workflow.graph.invoke(initial_state(), config=config)
 
-        result = workflow.graph.invoke(initial_state(), config=config_for("t1"))
+        result = approve(workflow, config)
 
         upload = storage.uploads[0]
         assert upload["container"] == settings.blob_storage.output_container
-        assert upload["blob_name"] == "doc-1/classification.json"
+        assert upload["blob_name"] == "doc-1/result.json"
         assert upload["content_type"] == "application/json"
         assert DocumentState.model_validate(result).output_blob_url is not None
 
     def test_audit_trail_records_every_node(self, settings: Settings) -> None:
         """The trail is what makes the run auditable after the fact."""
         workflow, _, _ = make_workflow(settings)
+        config = config_for("t1")
+        workflow.graph.invoke(initial_state(), config=config)
 
-        result = workflow.graph.invoke(initial_state(), config=config_for("t1"))
+        result = approve(workflow, config)
 
         agents = [entry.agent for entry in DocumentState.model_validate(result).audit_trail]
         assert agents == [
             AgentName.CLASSIFIER,
             AgentName.HUMAN_APPROVAL,
+            AgentName.EXTRACTOR,
+            AgentName.EXTRACTION_REVIEW,
             AgentName.SAVE,
         ]
 
@@ -169,12 +198,18 @@ class TestHumanApprovalCheckpoint:
             Command(resume={"approved": True, "reviewer": "naveen"}), config=config
         )
 
+        # Classification approved; now paused on the extracted data.
+        assert result["__interrupt__"][0].value["stage"] == "extraction"
         state = DocumentState.model_validate(result)
-        assert state.status is ProcessingStatus.COMPLETED
         assert state.approval is not None
         assert state.approval.approved is True
         assert state.approval.auto_approved is False
         assert state.approval.reviewer == "naveen"
+
+        result = approve(workflow, config)
+        assert DocumentState.model_validate(result).status is (
+            ProcessingStatus.COMPLETED
+        )
         assert len(storage.uploads) == 1
 
     def test_resume_with_rejection_marks_run_rejected(
@@ -235,10 +270,12 @@ class TestHumanApprovalCheckpoint:
         database = str(tmp_path / "checkpoints.sqlite")
         config = config_for("t4")
 
+        first_analysis = FakeAnalysisService()
         first = DocumentProcessingWorkflow(
             classifier=DocumentClassificationAgent(
-                low_confidence, FakeAnalysisService()
+                low_confidence, first_analysis
             ),
+            extractor=DataExtractionAgent(first_analysis),
             storage=FakeBlobStorage(),
             settings=settings,
             checkpointer=SqliteSaver(
@@ -249,16 +286,20 @@ class TestHumanApprovalCheckpoint:
 
         # A separate workflow object, as a later HTTP request would build.
         storage = FakeBlobStorage()
+        second_analysis = FakeAnalysisService()
         second = DocumentProcessingWorkflow(
             classifier=DocumentClassificationAgent(
-                low_confidence, FakeAnalysisService()
+                low_confidence, second_analysis
             ),
+            extractor=DataExtractionAgent(second_analysis),
             storage=storage,
             settings=settings,
             checkpointer=SqliteSaver(
                 sqlite3.connect(database, check_same_thread=False)
             ),
         )
+        # Both gates answered through the second connection.
+        second.graph.invoke(Command(resume={"approved": True}), config=config)
         result = second.graph.invoke(
             Command(resume={"approved": True}), config=config
         )
@@ -281,7 +322,9 @@ class TestVisionFallback:
             settings, language_model=language_model, analysis=analysis
         )
 
-        result = workflow.graph.invoke(initial_state(), config=config_for("t5"))
+        config = config_for("t5")
+        workflow.graph.invoke(initial_state(), config=config)
+        result = approve(workflow, config)
 
         state = DocumentState.model_validate(result)
         assert state.classification is not None
@@ -317,7 +360,9 @@ class TestErrorPath:
         storage = FakeBlobStorage(fail_with=RuntimeError("blob container gone"))
         workflow, _, _ = make_workflow(settings, storage=storage)
 
-        result = workflow.graph.invoke(initial_state(), config=config_for("t7"))
+        config = config_for("t7")
+        workflow.graph.invoke(initial_state(), config=config)
+        result = approve(workflow, config)
 
         state = DocumentState.model_validate(result)
         assert state.status is ProcessingStatus.FAILED
@@ -329,12 +374,16 @@ class TestStreaming:
         """The specification asks for invoke() and stream() to both work."""
         workflow, _, _ = make_workflow(settings)
 
-        steps = list(
-            workflow.graph.stream(initial_state(), config=config_for("t8"))
+        config = config_for("t8")
+        steps = list(workflow.graph.stream(initial_state(), config=config))
+        steps += list(
+            workflow.graph.stream(Command(resume={"approved": True}), config=config)
         )
 
         node_names = [name for step in steps for name in step]
         assert AgentName.CLASSIFIER.value in node_names
+        assert AgentName.EXTRACTOR.value in node_names
+        assert AgentName.EXTRACTION_REVIEW.value in node_names
         assert AgentName.SAVE.value in node_names
 
 
@@ -350,13 +399,23 @@ class TestSavedPayload:
                 return super().upload(container, blob_name, data, content_type)
 
         workflow, _, _ = make_workflow(settings, storage=CapturingStorage())
-        workflow.graph.invoke(initial_state(), config=config_for("t9"))
+        config = config_for("t9")
+        workflow.graph.invoke(initial_state(), config=config)
+        approve(workflow, config, reviewer="naveen")
 
         payload = json.loads(captured["data"])
         assert payload["document_id"] == "doc-1"
         assert payload["classification"]["document_type"] == "invoice"
         assert payload["approval"]["approved"] is True
-        assert len(payload["audit_trail"]) == 2  # classify + approval
+        # The finalised JSON the reviewer signed off.
+        assert payload["data"]["InvoiceId"] == "INV-123"
+        # ...alongside the per-field confidence it came with.
+        scores = {f["name"]: f["confidence"] for f in payload["extraction"]["fields"]}
+        assert scores["InvoiceId"] == 0.97
+        assert scores["VendorName"] is None
+        assert payload["extraction_review"]["reviewer"] == "naveen"
+        # classify, approval, extract, review, save
+        assert len(payload["audit_trail"]) == 4
 
 
 def _raise(_data: bytes) -> str:

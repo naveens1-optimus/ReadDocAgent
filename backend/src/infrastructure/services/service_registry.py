@@ -11,6 +11,7 @@ from application.interface.blob_storage_service import IBlobStorageService
 from application.interface.document_analysis_service import IDocumentAnalysisService
 from application.interface.language_model_service import ILanguageModelService
 from domain.schema.settings import Settings
+from infrastructure.agents.data_extraction_agent import DataExtractionAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -51,8 +52,12 @@ def register_services(container: DIContainer, settings: Settings) -> None:
     classifier = DocumentClassificationAgent(language_model, analysis)
     container.register(DocumentClassificationAgent, classifier)
 
+    extractor = DataExtractionAgent(analysis)
+    container.register(DataExtractionAgent, extractor)
+
     workflow = DocumentProcessingWorkflow(
         classifier=classifier,
+        extractor=extractor,
         storage=storage,
         settings=settings,
         checkpointer=build_checkpointer(settings.cosmos_db),

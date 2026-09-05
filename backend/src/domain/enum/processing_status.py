@@ -13,6 +13,8 @@ class ProcessingStatus(str, Enum):
     CLASSIFIED = "classified"
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
+    EXTRACTED = "extracted"
+    AWAITING_EXTRACTION_REVIEW = "awaiting_extraction_review"
     REJECTED = "rejected"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -32,5 +34,7 @@ class AgentName(str, Enum):
 
     CLASSIFIER = "classify"
     HUMAN_APPROVAL = "human_approval"
+    EXTRACTOR = "extract"
+    EXTRACTION_REVIEW = "extraction_review"
     SAVE = "save"
     ERROR_HANDLER = "error_handler"

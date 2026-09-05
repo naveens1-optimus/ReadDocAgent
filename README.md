@@ -4,19 +4,41 @@ A LangGraph pipeline that classifies uploaded documents with Azure AI, pauses
 for human approval when it is unsure, and stores the result.
 
 ```
-START -> classify -> human_approval -> save -> END
-             |
-             +-----> error_handler -> END
+START -> classify -> human_approval -> extract -> extraction_review -> save -> END
+             |            |                            |
+             |            +--> save (rejected, or no   |
+             |                       extraction model) |
+             +--> error_handler <----------------------+
 ```
 
 | Node | What it does |
 |---|---|
 | `classify` | Azure OpenAI vision over the rendered first page, falling back to Document Intelligence `prebuilt-read` text |
-| `human_approval` | Auto-approves confident results; otherwise pauses with `interrupt()` until a reviewer answers |
-| `save` | Writes the result JSON to Blob Storage |
+| `human_approval` | Confirms *what the document is*. Auto-approves confident results; otherwise pauses until a reviewer answers |
+| `extract` | Runs the Document Intelligence prebuilt model for the approved type |
+| `extraction_review` | Confirms *the data itself*. **Always** pauses; the reviewer edits the JSON before it is saved |
+| `save` | Writes the finalised JSON to Blob Storage |
 | `error_handler` | Terminal node for a failed run |
 
-Extraction becomes a fourth node after `human_approval`.
+### Extraction
+
+Each document type is extracted with its own prebuilt model:
+
+| Type | Model |
+|---|---|
+| invoice | `prebuilt-invoice` |
+| receipt | `prebuilt-receipt` |
+| contract, resume, id_card | *none yet* — classified and stored, extraction skipped |
+
+Adding a type is one line in `EXTRACTION_MODEL_BY_TYPE`
+([document_type.py](backend/src/domain/enum/document_type.py)).
+
+Every field carries **its own confidence score** where Document Intelligence
+reports one; a blank score means it reports none, which is different from
+reporting a low one. At `extraction_review` the reviewer sees each field with
+its score and can change values, drop fields or add new ones. Whatever they
+approve is what gets saved, with edited fields marked so the output
+distinguishes an extracted value from a corrected one.
 
 ## Setup
 
@@ -75,14 +97,20 @@ setting that is wrong.
 | `GET /health` | Liveness — stays green even when misconfigured, so the process is diagnosable |
 | `GET /health/ready` | Readiness — 503 naming the blocking component |
 
-## How the approval checkpoint works
+## How the two checkpoints work
 
-`CONFIDENCE_THRESHOLD` (default `0.80`) decides whether a human is asked:
+**Classification** is confidence-gated by `CONFIDENCE_THRESHOLD` (default `0.80`):
 
-- **At or above it**, and a recognised type → auto-approved, run completes.
-- **Below it**, or type `unsupported` → the graph pauses. The response has
-  `awaiting_approval: true` and an `approval_request` payload. The reviewer can
-  approve, reject, or correct the document type while approving.
+- **At or above it**, and a recognised type → auto-approved, no pause.
+- **Below it**, or type `unsupported` → pauses. The reviewer can approve,
+  reject, or correct the document type while approving.
+
+**Extraction review always pauses** — there is no confidence shortcut, because
+the reviewer is signing off the data that gets saved.
+
+Both use the same endpoint. The `approval_request` payload's `stage` field says
+which gate is open (`"classification"` or `"extraction"`), and the run's status
+is `awaiting_approval` or `awaiting_extraction_review` accordingly.
 
 State is checkpointed in **Cosmos DB**, so a run paused on one request resumes
 on a later one -- even from a different process.

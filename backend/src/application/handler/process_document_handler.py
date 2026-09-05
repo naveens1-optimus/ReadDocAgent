@@ -57,9 +57,10 @@ class ProcessDocumentHandler:
                 "Processing %s (%s bytes)", upload.file_name, upload.size_bytes
             )
 
+            blob_name = f"{document_id}/{upload.file_name}"
             input_blob_url = self._storage.upload(
                 container=self._settings.blob_storage.input_container,
-                blob_name=f"{document_id}/{upload.file_name}",
+                blob_name=blob_name,
                 data=data,
                 content_type=upload.content_type,
             )
@@ -72,6 +73,7 @@ class ProcessDocumentHandler:
                 is_pdf=upload.is_pdf,
                 file_bytes=data,
                 input_blob_url=input_blob_url,
+                input_blob_name=blob_name,
             )
 
             result = self._workflow.graph.invoke(

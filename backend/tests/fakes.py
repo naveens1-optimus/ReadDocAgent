@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from application.interface.blob_storage_service import IBlobStorageService
 from application.interface.document_analysis_service import IDocumentAnalysisService
+from domain.entity.extraction_result import ExtractedField, ExtractionResult
 from application.interface.language_model_service import ILanguageModelService, SchemaT
 
 __all__ = ["FakeBlobStorage", "FakeLanguageModel", "FakeAnalysisService"]
@@ -16,9 +17,15 @@ __all__ = ["FakeBlobStorage", "FakeLanguageModel", "FakeAnalysisService"]
 class FakeBlobStorage(IBlobStorageService):
     """Records uploads in memory."""
 
-    def __init__(self, fail_with: Exception | None = None) -> None:
+    def __init__(
+        self,
+        fail_with: Exception | None = None,
+        contents: bytes = b"stored document bytes",
+    ) -> None:
         self.uploads: list[dict[str, Any]] = []
+        self.downloads: list[str] = []
         self.fail_with = fail_with
+        self.contents = contents
 
     def upload(
         self,
@@ -38,6 +45,10 @@ class FakeBlobStorage(IBlobStorageService):
             }
         )
         return f"https://fake.blob.core.windows.net/{container}/{blob_name}"
+
+    def download(self, container: str, blob_name: str) -> bytes:
+        self.downloads.append(blob_name)
+        return self.contents
 
 
 class FakeLanguageModel(ILanguageModelService):
@@ -83,15 +94,35 @@ class FakeLanguageModel(ILanguageModelService):
 
 
 class FakeAnalysisService(IDocumentAnalysisService):
-    """Returns canned document text."""
+    """Returns canned document text and canned extracted fields."""
 
-    def __init__(self, text: str = "INVOICE #123 Total due: $500.00") -> None:
+    def __init__(
+        self,
+        text: str = "INVOICE #123 Total due: $500.00",
+        fields: list[ExtractedField] | None = None,
+        fail_extract: Exception | None = None,
+    ) -> None:
         self.text = text
         self.call_count = 0
+        self.fields = fields if fields is not None else [
+            ExtractedField(name="InvoiceId", value="INV-123", confidence=0.97),
+            ExtractedField(name="InvoiceTotal", value=500.0, confidence=0.62),
+            ExtractedField(name="VendorName", value="Acme", confidence=None),
+        ]
+        self.fail_extract = fail_extract
+        self.extract_calls: list[str] = []
 
     def extract_text(self, data: bytes) -> str:
         self.call_count += 1
         return self.text
+
+    def extract_fields(self, model_id: str, data: bytes) -> ExtractionResult:
+        if self.fail_extract is not None:
+            raise self.fail_extract
+        self.extract_calls.append(model_id)
+        return ExtractionResult(
+            model_id=model_id, fields=list(self.fields), page_count=1
+        )
 
 
 class Verdict(BaseModel):
