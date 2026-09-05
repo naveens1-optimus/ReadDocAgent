@@ -7,6 +7,7 @@ Intelligence (``prebuilt-read``) and classify that instead.
 
 from __future__ import annotations
 
+from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from application.interface.document_analysis_service import IDocumentAnalysisService
@@ -70,6 +71,7 @@ class DocumentClassificationAgent:
         self._language_model = language_model
         self._analysis_service = analysis_service
 
+    @traceable(name="document_classifier", run_type="chain")
     def classify(self, data: bytes, extension: str) -> ClassificationResult:
         """Classify a document, falling back to text if vision fails.
 

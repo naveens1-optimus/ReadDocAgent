@@ -6,6 +6,7 @@ import io
 
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
+from langsmith import traceable
 
 from application.interface.document_analysis_service import IDocumentAnalysisService
 from domain.schema.settings import DocumentIntelligenceSettings, RetryPolicySettings
@@ -34,6 +35,7 @@ class AzureDocumentIntelligenceService(IDocumentAnalysisService):
         )
         self._analyze_with_retry = azure_retry(retry_policy)(self._analyze_once)
 
+    @traceable(name="document_intelligence_read", run_type="tool")
     def extract_text(self, data: bytes) -> str:
         """Return the document's text using ``prebuilt-read``."""
         result = self._analyze_with_retry(PREBUILT_READ, data)

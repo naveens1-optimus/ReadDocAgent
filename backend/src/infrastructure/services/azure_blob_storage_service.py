@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from azure.core.exceptions import ResourceExistsError
 from azure.storage.blob import BlobServiceClient, ContentSettings
+from langsmith import traceable
 
 from application.interface.blob_storage_service import IBlobStorageService
 from domain.schema.settings import BlobStorageSettings, RetryPolicySettings
@@ -29,6 +30,9 @@ class AzureBlobStorageService(IBlobStorageService):
         # once per container per process.
         self._known_containers: set[str] = set()
 
+    # Plain SDK calls are invisible to LangSmith, unlike LangChain
+    # components. @traceable adds a span; it no-ops when tracing is off.
+    @traceable(name="blob_upload", run_type="tool")
     def upload(
         self,
         container: str,
