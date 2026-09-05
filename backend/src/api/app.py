@@ -31,9 +31,11 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from api.route import health
+from api.route import documents, health
 from domain.schema.error_response import ErrorResponse
 from infrastructure.config.settings import get_settings
+from infrastructure.di_container import DIContainer
+from infrastructure.services.service_registry import register_services
 from infrastructure.utilities.logging_config import (
     configure_logging,
     get_logger,
@@ -127,10 +129,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # itself logged properly.
     configure_logging(force=True)
 
+    app.state.settings = None
+    app.state.settings_error = None
+    app.state.container = None
+    app.state.services_error = None
+
     try:
         settings = get_settings()
     except Exception as exc:  # noqa: BLE001 - recorded and surfaced by readiness
-        app.state.settings = None
         app.state.settings_error = str(exc)
         logger.error(
             "Configuration failed to load; the server is running but NOT ready. %s",
@@ -144,11 +150,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             force=True,
         )
         app.state.settings = settings
-        app.state.settings_error = None
-        logger.info(
-            "Configuration loaded\n%s",
-            settings.summary(),
-        )
+        logger.info("Configuration loaded\n%s", settings.summary())
+
+        # Build the Azure clients. Constructing them does not call Azure, so
+        # a failure here means bad settings rather than an outage.
+        container = DIContainer()
+        try:
+            register_services(container, settings)
+        except Exception as exc:  # noqa: BLE001 - surfaced by readiness
+            app.state.services_error = str(exc)
+            logger.error("Failed to build Azure services: %s", exc)
+        else:
+            app.state.container = container
 
     logger.info("Application startup complete (version %s)", __version__)
     yield
@@ -256,6 +269,7 @@ def create_app() -> FastAPI:
     _register_exception_handlers(app)
 
     app.include_router(health.router)
+    app.include_router(documents.router)
 
     @app.get("/", include_in_schema=False)
     async def _root() -> RedirectResponse:

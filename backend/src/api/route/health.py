@@ -62,19 +62,27 @@ async def health(request: Request) -> HealthResponse:
 async def readiness(request: Request, response: Response) -> ReadinessResponse:
     """Report whether the service can serve real traffic.
 
-    Currently the only gate is configuration. As Azure adapters are added they
-    register further components here, so readiness reflects the whole
-    dependency set rather than just the process.
+    Two gates: configuration resolved, and the Azure clients built. Both are
+    local checks -- a probe must stay fast, so it deliberately does not call
+    Azure. Whether the credentials actually work is proved by the first real
+    upload.
     """
-    settings = getattr(request.app.state, "settings", None)
-    settings_error = getattr(request.app.state, "settings_error", None)
+    state = request.app.state
+    settings = getattr(state, "settings", None)
+    container = getattr(state, "container", None)
 
     components = [
         ComponentStatus(
             name="configuration",
             ready=settings is not None,
-            detail=settings_error,
-        )
+            detail=getattr(state, "settings_error", None),
+        ),
+        ComponentStatus(
+            name="azure_services",
+            ready=container is not None,
+            detail=getattr(state, "services_error", None)
+            or (None if container is not None else "not built"),
+        ),
     ]
 
     result = ReadinessResponse(
