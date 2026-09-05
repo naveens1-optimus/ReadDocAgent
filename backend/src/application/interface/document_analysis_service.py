@@ -20,6 +20,14 @@ class IDocumentAnalysisService(ABC):
         """
 
     @abstractmethod
+    def extract_text_with(self, model_id: str, data: bytes) -> str:
+        """Return the document's text using the given model.
+
+        ``prebuilt-layout`` keeps tables and spatial structure, which matters
+        for contracts; ``prebuilt-read`` is text only and cheaper.
+        """
+
+    @abstractmethod
     def extract_fields(self, model_id: str, data: bytes) -> ExtractionResult:
         """Extract structured fields using the given prebuilt model.
 

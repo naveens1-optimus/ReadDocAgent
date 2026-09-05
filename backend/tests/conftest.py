@@ -111,9 +111,9 @@ def _ignore_local_dotenv(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def _offline_checkpointer(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Swap the Cosmos DB checkpointer for an in-memory SQLite one.
 
-    ``CosmosDBSaverSync`` connects and creates its database in its
-    constructor, so building the services would otherwise make a real network
-    call during app startup. The suite must run offline and fast, and the
+    ``CosmosDBSaverSync`` and ``CosmosEntityStore`` both connect in their
+    constructors, so building the services would otherwise make real network
+    calls during app startup. The suite must run offline and fast, and the
     checkpointer is injected, so substituting it here changes nothing about
     what the tests actually exercise.
     """
@@ -121,11 +121,19 @@ def _offline_checkpointer(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     from langgraph.checkpoint.sqlite import SqliteSaver
 
+    from tests.fakes import FakeEntityStore
+
     monkeypatch.setattr(
         "infrastructure.services.service_registry.build_checkpointer",
         lambda _settings: SqliteSaver(
             sqlite3.connect(":memory:", check_same_thread=False)
         ),
+    )
+    # CosmosEntityStore also connects in its constructor, so it would make a
+    # real network call during app startup.
+    monkeypatch.setattr(
+        "infrastructure.services.service_registry.CosmosEntityStore",
+        lambda *args, **kwargs: FakeEntityStore(),
     )
     yield
 

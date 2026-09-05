@@ -8,10 +8,16 @@ from pydantic import BaseModel
 
 from application.interface.blob_storage_service import IBlobStorageService
 from application.interface.document_analysis_service import IDocumentAnalysisService
+from application.interface.entity_store import IEntityStore
 from domain.entity.extraction_result import ExtractedField, ExtractionResult
 from application.interface.language_model_service import ILanguageModelService, SchemaT
 
-__all__ = ["FakeBlobStorage", "FakeLanguageModel", "FakeAnalysisService"]
+__all__ = [
+    "FakeBlobStorage",
+    "FakeLanguageModel",
+    "FakeAnalysisService",
+    "FakeEntityStore",
+]
 
 
 class FakeBlobStorage(IBlobStorageService):
@@ -58,13 +64,23 @@ class FakeLanguageModel(ILanguageModelService):
         self,
         answer: dict[str, Any] | None = None,
         fail_on_image: Exception | None = None,
+        enrichment: dict[str, Any] | None = None,
+        structured: dict[str, Any] | None = None,
+        fail_enrichment: Exception | None = None,
     ) -> None:
         self.answer = answer or {
             "document_type": "invoice",
             "confidence": 0.94,
             "reasoning": "Has an invoice number and totals.",
         }
+        self.enrichment = enrichment or {
+            "summary": "An invoice from Acme for 500.00 USD.",
+            "enriched": [],
+        }
+        #: What the structuring path returns for contracts and resumes.
+        self.structured = structured or {}
         self.fail_on_image = fail_on_image
+        self.fail_enrichment = fail_enrichment
         self.calls: list[dict[str, Any]] = []
 
     def structured_completion(
@@ -85,7 +101,18 @@ class FakeLanguageModel(ILanguageModelService):
         )
         if image is not None and self.fail_on_image is not None:
             raise self.fail_on_image
-        return schema.model_validate(self.answer)
+
+        fields = set(schema.model_fields)
+
+        # The agents ask for different shapes; answer whichever was asked for.
+        if {"summary", "enriched"} <= fields:
+            if self.fail_enrichment is not None:
+                raise self.fail_enrichment
+            return schema.model_validate(self.enrichment)
+        if {"document_type", "confidence", "reasoning"} <= fields:
+            return schema.model_validate(self.answer)
+        # The structuring path (contracts, resumes).
+        return schema.model_validate(self.structured)
 
     @property
     def used_vision(self) -> bool:
@@ -111,9 +138,14 @@ class FakeAnalysisService(IDocumentAnalysisService):
         ]
         self.fail_extract = fail_extract
         self.extract_calls: list[str] = []
+        self.text_calls: list[str] = []
 
     def extract_text(self, data: bytes) -> str:
+        return self.extract_text_with("prebuilt-read", data)
+
+    def extract_text_with(self, model_id: str, data: bytes) -> str:
         self.call_count += 1
+        self.text_calls.append(model_id)
         return self.text
 
     def extract_fields(self, model_id: str, data: bytes) -> ExtractionResult:
@@ -131,3 +163,25 @@ class Verdict(BaseModel):
     document_type: str
     confidence: float
     reasoning: str
+
+
+class FakeEntityStore(IEntityStore):
+    """Records saved entities in memory."""
+
+    def __init__(self, fail_with: Exception | None = None) -> None:
+        self.saved: dict[str, dict[str, Any]] = {}
+        self.fail_with = fail_with
+
+    def save(
+        self, document_id: str, document_type: str, entity: dict[str, Any]
+    ) -> str:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.saved[document_id] = {
+            "document_type": document_type,
+            "entity": entity,
+        }
+        return document_id
+
+    def get(self, document_id: str) -> dict[str, Any] | None:
+        return self.saved.get(document_id)

@@ -45,6 +45,21 @@ class ProcessDocumentResponse(BaseModel):
     #: flattened for consumers that only want the values.
     data: dict[str, Any] = Field(default_factory=dict)
 
+    #: The validated entity, once every required field is present.
+    entity: dict[str, Any] | None = None
+
+    #: Short document summary, from enrichment.
+    summary: str | None = None
+
+    #: Required schema fields the extraction could not supply.
+    missing_fields: list[str] = Field(default_factory=list)
+
+    #: Fields whose extraction confidence was below the threshold.
+    low_confidence_fields: list[str] = Field(default_factory=list)
+
+    #: Validation checks, passed and failed.
+    validation_checks: list[dict[str, Any]] = Field(default_factory=list)
+
     error: str | None = None
 
     # Blob URLs and the audit trail are deliberately not returned. Both are
@@ -61,6 +76,7 @@ class ProcessDocumentResponse(BaseModel):
         """Build a response from the graph's ``DocumentState``."""
         classification = state.classification
         extraction = state.extraction
+        validation = state.validation
         return cls(
             document_id=state.document_id,
             file_name=state.file_name,
@@ -74,6 +90,17 @@ class ProcessDocumentResponse(BaseModel):
             extraction_model=extraction.model_id if extraction else None,
             fields=list(extraction.fields) if extraction else [],
             data=extraction.to_json() if extraction else {},
+            entity=validation.entity if validation else None,
+            summary=validation.summary if validation else None,
+            missing_fields=list(validation.missing_fields) if validation else [],
+            low_confidence_fields=(
+                list(validation.low_confidence_fields) if validation else []
+            ),
+            validation_checks=(
+                [check.model_dump(mode="json") for check in validation.checks]
+                if validation
+                else []
+            ),
             error=state.error,
         )
 
@@ -86,6 +113,9 @@ def _paused_status(approval_request: dict[str, Any] | None) -> ProcessingStatus 
     """
     if approval_request is None:
         return None
-    if approval_request.get("stage") == "extraction":
+    stage = approval_request.get("stage")
+    if stage == "extraction":
         return ProcessingStatus.AWAITING_EXTRACTION_REVIEW
+    if stage == "field_completion":
+        return ProcessingStatus.AWAITING_FIELD_COMPLETION
     return ProcessingStatus.AWAITING_APPROVAL

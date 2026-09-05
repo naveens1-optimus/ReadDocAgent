@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from domain.entity.audit_entry import AuditEntry
 from domain.entity.classification_result import ClassificationResult
 from domain.entity.extraction_result import ExtractionResult
+from domain.entity.validation_result import ValidationResult
 from domain.enum.processing_status import ProcessingStatus
 
 __all__ = ["ApprovalDecision", "ExtractionReview", "DocumentState"]
@@ -68,6 +69,19 @@ class DocumentState(BaseModel):
     #: After the review step, values are the reviewer's finalised ones.
     extraction: ExtractionResult | None = None
     extraction_review: ExtractionReview | None = None
+
+    #: What validation found, and the enrichment that followed it.
+    validation: ValidationResult | None = None
+
+    #: Values a reviewer supplied for required fields the extraction missed.
+    completed_fields: dict[str, Any] = Field(default_factory=dict)
+
+    #: Set when a reviewer chose to continue despite fields still missing,
+    #: so the graph does not ask again in a loop.
+    skip_completion: bool = False
+
+    #: Id of the entity written to Cosmos DB.
+    entity_id: str | None = None
 
     output_blob_url: str | None = None
 

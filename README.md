@@ -4,34 +4,85 @@ A LangGraph pipeline that classifies uploaded documents with Azure AI, pauses
 for human approval when it is unsure, and stores the result.
 
 ```
-START -> classify -> human_approval -> extract -> extraction_review -> save -> END
-             |            |                            |
-             |            +--> save (rejected, or no   |
-             |                       extraction model) |
-             +--> error_handler <----------------------+
+classify -> human_approval -> extract -> extraction_review -> validate
+                                                                 |
+                    +--> complete_fields <--(missing required)---+
+                    |          |                                 |
+                    +----------+                          (complete)
+                                                                 |
+                                        save <-- enrich <--------+
 ```
 
-| Node | What it does |
+Four agents:
+
+| Agent | Node(s) | What it does |
+|---|---|---|
+| 1 Classifier | `classify` | Azure OpenAI vision over the rendered first page, falling back to Document Intelligence `prebuilt-read` text |
+| 2 Extraction | `extract` | Runs the Document Intelligence model for the approved type |
+| 3 Validation & Enrichment | `validate`, `complete_fields`, `enrich` | Checks the data against the entity schema, then standardises and summarises it with Azure OpenAI |
+| 4 Output & Storage | `save` | Stores the entity in Cosmos DB, and the output plus processing report in Blob Storage |
+
+A failure in any node routes to `error_handler`.
+
+### Three human checkpoints
+
+Each gates something different:
+
+| Checkpoint | When it pauses |
 |---|---|
-| `classify` | Azure OpenAI vision over the rendered first page, falling back to Document Intelligence `prebuilt-read` text |
-| `human_approval` | Confirms *what the document is*. Auto-approves confident results; otherwise pauses until a reviewer answers |
-| `extract` | Runs the Document Intelligence prebuilt model for the approved type |
-| `extraction_review` | Confirms *the data itself*. **Always** pauses; the reviewer edits the JSON before it is saved |
-| `save` | Writes the finalised JSON to Blob Storage |
-| `error_handler` | Terminal node for a failed run |
+| `human_approval` | Only when the classification is doubtful — below `CONFIDENCE_THRESHOLD`, or type `unsupported` |
+| `extraction_review` | **Always.** The reviewer is signing off the data itself, and may edit it first |
+| `complete_fields` | Only when the schema requires a field the extraction could not supply |
+
+`complete_fields` loops back through `validate`, so supplied values are checked
+like any others. A reviewer who cannot supply a value can tick *continue
+regardless* — the run finishes and the output is saved, but no entity is
+stored, because the data never validated.
 
 ### Extraction
 
 Each document type is extracted with its own prebuilt model:
 
-| Type | Model |
-|---|---|
-| invoice | `prebuilt-invoice` |
-| receipt | `prebuilt-receipt` |
-| contract, resume, id_card | *none yet* — classified and stored, extraction skipped |
+| Type | Model | Path |
+|---|---|---|
+| invoice | `prebuilt-invoice` | typed fields, with per-field confidence |
+| receipt | `prebuilt-receipt` | typed fields, with per-field confidence |
+| contract | `prebuilt-layout` | text + tables, structured by Azure OpenAI |
+| resume | `prebuilt-read` | text, structured by Azure OpenAI |
+| id_card | *none yet* | classified and stored, extraction skipped |
+
+Only the document-specific models return per-field confidence scores. On the
+layout/read path the fields report `None` rather than inventing a number.
 
 Adding a type is one line in `EXTRACTION_MODEL_BY_TYPE`
-([document_type.py](backend/src/domain/enum/document_type.py)).
+([document_type.py](backend/src/domain/enum/document_type.py)) plus an entity
+schema.
+
+### Entity schemas
+
+Validation runs against a Pydantic entity per type
+([domain/entity/](backend/src/domain/entity/)). The schema *is* the
+completeness rule: a field declared without a default is required, and if the
+extraction cannot supply it the pipeline pauses and asks a human.
+
+| Type | Required fields |
+|---|---|
+| invoice | `vendor_name`, `invoice_id`, `invoice_total` |
+| receipt | `merchant_name`, `total` |
+| contract | `title`, `parties` |
+| resume | `full_name` |
+
+Validated entities are stored in Cosmos DB, keyed on document id, in their own
+container (`AZURE_COSMOS_ENTITY_CONTAINER`, default `entities`) — separate
+from the checkpointer's container.
+
+### Processing report
+
+Written to `{document_id}/report.json` in the output container, with the four
+sections the specification asks for: classification result and confidence;
+extraction summary with field-level confidence scores (weakest first, with
+bounding boxes and page numbers); validation results, passed and failed; and
+anything flagged for human review.
 
 Every field carries **its own confidence score** where Document Intelligence
 reports one; a blank score means it reports none, which is different from

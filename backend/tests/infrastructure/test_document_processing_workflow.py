@@ -13,6 +13,7 @@ from domain.enum.document_type import DocumentType
 from domain.enum.processing_status import AgentName, ProcessingStatus
 from domain.schema.settings import Settings
 from infrastructure.agents.data_extraction_agent import DataExtractionAgent
+from infrastructure.agents.validation_agent import ValidationAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -21,7 +22,12 @@ from infrastructure.workflows.document_processing_workflow import (
     DocumentProcessingWorkflow,
 )
 from infrastructure.workflows.state import DocumentState
-from tests.fakes import FakeAnalysisService, FakeBlobStorage, FakeLanguageModel
+from tests.fakes import (
+    FakeAnalysisService,
+    FakeBlobStorage,
+    FakeEntityStore,
+    FakeLanguageModel,
+)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n fake image bytes"
 
@@ -44,8 +50,10 @@ def make_workflow(
 
     workflow = DocumentProcessingWorkflow(
         classifier=DocumentClassificationAgent(language_model, analysis),
-        extractor=DataExtractionAgent(analysis),
+        extractor=DataExtractionAgent(analysis, language_model),
+        validator=ValidationAgent(language_model),
         storage=storage,
+        entities=FakeEntityStore(),
         settings=settings,
         checkpointer=SqliteSaver(sqlite3.connect(":memory:", check_same_thread=False)),
     )
@@ -104,7 +112,7 @@ class TestConfidentClassification:
 
         state = DocumentState.model_validate(result)
         assert state.status is ProcessingStatus.COMPLETED
-        assert len(storage.uploads) == 1
+        assert len(storage.uploads) == 2  # result.json + report.json
 
     def test_saves_result_json_to_output_container(
         self, settings: Settings
@@ -135,6 +143,8 @@ class TestConfidentClassification:
             AgentName.HUMAN_APPROVAL,
             AgentName.EXTRACTOR,
             AgentName.EXTRACTION_REVIEW,
+            AgentName.VALIDATOR,
+            AgentName.ENRICHER,
             AgentName.SAVE,
         ]
 
@@ -210,7 +220,7 @@ class TestHumanApprovalCheckpoint:
         assert DocumentState.model_validate(result).status is (
             ProcessingStatus.COMPLETED
         )
-        assert len(storage.uploads) == 1
+        assert len(storage.uploads) == 2  # result.json + report.json
 
     def test_resume_with_rejection_marks_run_rejected(
         self, settings: Settings, low_confidence: FakeLanguageModel
@@ -227,7 +237,7 @@ class TestHumanApprovalCheckpoint:
         state = DocumentState.model_validate(result)
         assert state.status is ProcessingStatus.REJECTED
         # Still saved, so the rejection is recorded rather than lost.
-        assert len(storage.uploads) == 1
+        assert len(storage.uploads) == 2  # result.json + report.json
 
     def test_reviewer_can_correct_the_document_type(
         self, settings: Settings, low_confidence: FakeLanguageModel
@@ -275,8 +285,10 @@ class TestHumanApprovalCheckpoint:
             classifier=DocumentClassificationAgent(
                 low_confidence, first_analysis
             ),
-            extractor=DataExtractionAgent(first_analysis),
+            extractor=DataExtractionAgent(first_analysis, low_confidence),
+            validator=ValidationAgent(low_confidence),
             storage=FakeBlobStorage(),
+            entities=FakeEntityStore(),
             settings=settings,
             checkpointer=SqliteSaver(
                 sqlite3.connect(database, check_same_thread=False)
@@ -291,8 +303,10 @@ class TestHumanApprovalCheckpoint:
             classifier=DocumentClassificationAgent(
                 low_confidence, second_analysis
             ),
-            extractor=DataExtractionAgent(second_analysis),
+            extractor=DataExtractionAgent(second_analysis, low_confidence),
+            validator=ValidationAgent(low_confidence),
             storage=storage,
+            entities=FakeEntityStore(),
             settings=settings,
             checkpointer=SqliteSaver(
                 sqlite3.connect(database, check_same_thread=False)
@@ -307,7 +321,7 @@ class TestHumanApprovalCheckpoint:
         state = DocumentState.model_validate(result)
         assert state.status is ProcessingStatus.COMPLETED
         assert state.classification is not None
-        assert len(storage.uploads) == 1
+        assert len(storage.uploads) == 2  # result.json + report.json
 
 
 class TestVisionFallback:
@@ -394,8 +408,10 @@ class TestSavedPayload:
         captured: dict[str, bytes] = {}
 
         class CapturingStorage(FakeBlobStorage):
+            # Keyed by blob name: save writes both result.json and
+            # report.json, so a single slot would only keep the last one.
             def upload(self, container, blob_name, data, content_type=None):  # type: ignore[override]
-                captured["data"] = data
+                captured[blob_name] = data
                 return super().upload(container, blob_name, data, content_type)
 
         workflow, _, _ = make_workflow(settings, storage=CapturingStorage())
@@ -403,19 +419,30 @@ class TestSavedPayload:
         workflow.graph.invoke(initial_state(), config=config)
         approve(workflow, config, reviewer="naveen")
 
-        payload = json.loads(captured["data"])
+        payload = json.loads(captured["doc-1/result.json"])
         assert payload["document_id"] == "doc-1"
-        assert payload["classification"]["document_type"] == "invoice"
-        assert payload["approval"]["approved"] is True
-        # The finalised JSON the reviewer signed off.
-        assert payload["data"]["InvoiceId"] == "INV-123"
+
+        # The validated entity the reviewer signed off.
+        assert payload["entity"]["invoice_id"] == "INV-123"
+        assert payload["summary"]
+
         # ...alongside the per-field confidence it came with.
         scores = {f["name"]: f["confidence"] for f in payload["extraction"]["fields"]}
         assert scores["InvoiceId"] == 0.97
         assert scores["VendorName"] is None
-        assert payload["extraction_review"]["reviewer"] == "naveen"
-        # classify, approval, extract, review, save
-        assert len(payload["audit_trail"]) == 4
+
+        # The report is saved on its own as well as inside the result.
+        assert json.loads(captured["doc-1/report.json"])["document_id"] == "doc-1"
+
+        # All four report sections.
+        report = payload["report"]
+        assert report["classification"]["document_type"] == "invoice"
+        assert report["extraction"]["model_id"] == "prebuilt-invoice"
+        assert report["validation"]["total_checks"] > 0
+        assert "naveen" in report["review"]["reviewers"]
+
+        # classify, approval, extract, review, validate, enrich, save
+        assert len(payload["audit_trail"]) == 6
 
 
 def _raise(_data: bytes) -> str:

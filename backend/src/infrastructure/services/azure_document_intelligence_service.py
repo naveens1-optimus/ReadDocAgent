@@ -42,18 +42,22 @@ class AzureDocumentIntelligenceService(IDocumentAnalysisService):
         )
         self._analyze_with_retry = azure_retry(retry_policy)(self._analyze_once)
 
-    @traceable(name="document_intelligence_read", run_type="tool")
     def extract_text(self, data: bytes) -> str:
         """Return the document's text using ``prebuilt-read``."""
-        result = self._analyze_with_retry(PREBUILT_READ, data)
+        return self.extract_text_with(PREBUILT_READ, data)
+
+    @traceable(name="document_intelligence_text", run_type="tool")
+    def extract_text_with(self, model_id: str, data: bytes) -> str:
+        """Return the document's text using the given model."""
+        result = self._analyze_with_retry(model_id, data)
         text = result.content or ""
         page_count = len(result.pages or [])
         logger.info(
             "Read %s characters across %s page(s) with %s",
             len(text),
             page_count,
-            PREBUILT_READ,
-            extra={"model_id": PREBUILT_READ, "page_count": page_count},
+            model_id,
+            extra={"model_id": model_id, "page_count": page_count},
         )
         return text
 

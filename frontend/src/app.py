@@ -8,7 +8,9 @@ Talks to three endpoints:
 
     GET  /health/ready              can the backend do work?
     POST /documents                 upload and run the graph
-    POST /documents/{id}/approval   resume a run paused for approval
+    POST /documents/{id}/approval   resume a run paused at any of the three
+                                    checkpoints -- classification, extraction
+                                    review, or missing-field completion
 
 Requests are made from Streamlit's own Python process, not the browser, so no
 CORS configuration is needed on the API.
@@ -35,8 +37,12 @@ SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "bmp", "tif", "tiff", "heif"]
 STATUS_COLOURS = {
     "completed": "green",
     "approved": "green",
+    "validated": "green",
     "awaiting_approval": "orange",
+    "awaiting_extraction_review": "orange",
+    "awaiting_field_completion": "orange",
     "classified": "blue",
+    "extracted": "blue",
     "rejected": "red",
     "failed": "red",
 }
@@ -85,6 +91,7 @@ def submit_approval(
     approved: bool,
     document_type: str | None = None,
     fields: dict | None = None,
+    skip: bool = False,
     reviewer: str | None = None,
     note: str | None = None,
 ) -> dict:
@@ -99,6 +106,7 @@ def submit_approval(
             "approved": approved,
             "document_type": document_type,
             "fields": fields,
+            "skip": skip,
             "reviewer": reviewer or None,
             "note": note or None,
         },
@@ -148,6 +156,9 @@ def render_approval(api_url: str, result: dict) -> None:
     request = result.get("approval_request") or {}
     if request.get("stage") == "extraction":
         render_extraction_review(api_url, result, request)
+        return
+    if request.get("stage") == "field_completion":
+        render_field_completion(api_url, result, request)
         return
 
     st.warning("The classifier was not confident enough, so the run paused here.")
@@ -281,6 +292,64 @@ def render_extraction_review(api_url: str, result: dict, request: dict) -> None:
     st.rerun()
 
 
+def render_field_completion(api_url: str, result: dict, request: dict) -> None:
+    """Ask the reviewer for required fields the extraction could not read."""
+    missing = list(request.get("missing_fields") or [])
+
+    st.error(
+        f"The {request.get('document_type')} schema requires "
+        f"{len(missing)} field(s) the extraction could not read."
+    )
+
+    for message in request.get("failed_checks") or []:
+        st.caption(f"· {message}")
+
+    with st.form("completion_form"):
+        supplied: dict[str, str] = {}
+        for name in missing:
+            supplied[name] = st.text_input(name, key=f"missing_{name}")
+
+        reviewer = st.text_input("Your name (optional)")
+        skip = st.checkbox(
+            "Continue without these fields",
+            help=(
+                "The run finishes and the output is saved, but no validated "
+                "entity is stored, because the data is incomplete."
+            ),
+        )
+        submitted = st.form_submit_button(
+            "Submit", type="primary", use_container_width=True
+        )
+
+    with st.expander("Data extracted so far"):
+        st.json(request.get("current") or {})
+
+    if not submitted:
+        return
+
+    filled = {name: value for name, value in supplied.items() if value.strip()}
+    if not filled and not skip:
+        st.warning(
+            "Fill in at least one field, or tick 'Continue without these fields'."
+        )
+        return
+
+    with st.spinner("Re-validating..."):
+        try:
+            st.session_state.result = submit_approval(
+                api_url,
+                result["document_id"],
+                approved=True,
+                fields=filled or None,
+                skip=skip,
+                reviewer=reviewer,
+            )
+        except (RuntimeError, requests.RequestException) as exc:
+            st.error(str(exc))
+            return
+    st.rerun()
+
+
 def _to_cell(value: Any) -> str:
     """Render a value for the editor. Nested values become JSON text."""
     if value is None:
@@ -347,6 +416,31 @@ def render_result(result: dict) -> None:
 
     if result.get("error"):
         st.error(result["error"])
+
+    if result.get("summary"):
+        st.info(result["summary"])
+
+    if result.get("missing_fields"):
+        st.warning(
+            "Saved without required field(s): "
+            + ", ".join(result["missing_fields"])
+            + " -- no entity was stored."
+        )
+
+    entity = result.get("entity")
+    if entity:
+        st.markdown("#### Validated entity")
+        st.caption("Stored in Cosmos DB against this document id.")
+        st.json(entity)
+
+    checks = result.get("validation_checks") or []
+    if checks:
+        with st.expander(
+            f"Validation ({sum(1 for c in checks if c['passed'])}/{len(checks)} passed)"
+        ):
+            for check in checks:
+                mark = ":green[PASS]" if check["passed"] else ":red[FAIL]"
+                st.markdown(f"- {mark} **{check['name']}** — {check['message']}")
 
     fields = result.get("fields") or []
     if fields:

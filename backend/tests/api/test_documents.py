@@ -13,6 +13,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from api.app import create_app
 from application.handler.process_document_handler import ProcessDocumentHandler
 from infrastructure.agents.data_extraction_agent import DataExtractionAgent
+from infrastructure.agents.validation_agent import ValidationAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -21,7 +22,12 @@ from infrastructure.di_container import DIContainer
 from infrastructure.workflows.document_processing_workflow import (
     DocumentProcessingWorkflow,
 )
-from tests.fakes import FakeAnalysisService, FakeBlobStorage, FakeLanguageModel
+from tests.fakes import (
+    FakeAnalysisService,
+    FakeBlobStorage,
+    FakeEntityStore,
+    FakeLanguageModel,
+)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n fake image bytes"
 
@@ -63,8 +69,10 @@ def make_harness(valid_env: dict[str, str]):
         analysis = FakeAnalysisService()
         workflow = DocumentProcessingWorkflow(
             classifier=DocumentClassificationAgent(language_model, analysis),
-            extractor=DataExtractionAgent(analysis),
+            extractor=DataExtractionAgent(analysis, language_model),
+        validator=ValidationAgent(language_model),
             storage=storage,
+            entities=FakeEntityStore(),
             settings=settings,
             checkpointer=SqliteSaver(
                 sqlite3.connect(":memory:", check_same_thread=False)

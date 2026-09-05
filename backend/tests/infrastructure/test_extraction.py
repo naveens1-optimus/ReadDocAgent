@@ -11,6 +11,7 @@ from langgraph.types import Command
 from domain.enum.processing_status import AgentName, ProcessingStatus
 from domain.schema.settings import Settings
 from infrastructure.agents.data_extraction_agent import DataExtractionAgent
+from infrastructure.agents.validation_agent import ValidationAgent
 from infrastructure.agents.document_classification_agent import (
     DocumentClassificationAgent,
 )
@@ -19,7 +20,12 @@ from infrastructure.workflows.document_processing_workflow import (
     DocumentProcessingWorkflow,
 )
 from infrastructure.workflows.state import DocumentState
-from tests.fakes import FakeAnalysisService, FakeBlobStorage, FakeLanguageModel
+from tests.fakes import (
+    FakeAnalysisService,
+    FakeBlobStorage,
+    FakeEntityStore,
+    FakeLanguageModel,
+)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n fake image bytes"
 
@@ -41,8 +47,10 @@ def make_workflow(
 
     workflow = DocumentProcessingWorkflow(
         classifier=DocumentClassificationAgent(language_model, analysis),
-        extractor=DataExtractionAgent(analysis),
+        extractor=DataExtractionAgent(analysis, language_model),
+        validator=ValidationAgent(language_model),
         storage=storage,
+        entities=FakeEntityStore(),
         settings=settings,
         checkpointer=SqliteSaver(sqlite3.connect(":memory:", check_same_thread=False)),
     )
@@ -94,23 +102,54 @@ class TestModelRouting:
 
         assert analysis.extract_calls == [expected_model]
 
-    @pytest.mark.parametrize("document_type", ["contract", "resume", "id_card"])
-    def test_unsupported_types_skip_extraction(
-        self, settings: Settings, document_type: str
+    @pytest.mark.parametrize(
+        ("document_type", "expected_model"),
+        [("contract", "prebuilt-layout"), ("resume", "prebuilt-read")],
+    )
+    def test_text_types_are_structured_by_the_language_model(
+        self, settings: Settings, document_type: str, expected_model: str
     ) -> None:
-        """No model yet, so the run completes without extracting."""
-        workflow, storage, analysis = make_workflow(
-            settings, language_model=model_saying(document_type)
+        """Layout and read return text, so the model fills the schema.
+
+        There are no per-field confidence scores on this path, and the fields
+        report None rather than inventing one.
+        """
+        structured = (
+            {"title": "Master Services Agreement", "parties": ["Acme", "Globex"]}
+            if document_type == "contract"
+            else {"full_name": "Ada Lovelace", "skills": ["Python"]}
+        )
+        language_model = model_saying(document_type)
+        language_model.structured = structured
+        workflow, _, analysis = make_workflow(
+            settings, language_model=language_model
         )
 
-        result = workflow.graph.invoke(state(), config(f"s-{document_type}"))
+        result = workflow.graph.invoke(state(), config(f"t-{document_type}"))
+
+        # Text was read with the right model, and no typed-field call was made.
+        assert expected_model in analysis.text_calls
+        assert analysis.extract_calls == []
+
+        payload = result["__interrupt__"][0].value
+        assert payload["stage"] == "extraction"
+        assert payload["model_id"] == expected_model
+        assert all(field["confidence"] is None for field in payload["fields"])
+
+    def test_id_cards_skip_extraction(self, settings: Settings) -> None:
+        """No entity schema and no model, so the run completes without one."""
+        workflow, storage, analysis = make_workflow(
+            settings, language_model=model_saying("id_card")
+        )
+
+        result = workflow.graph.invoke(state(), config("s-id"))
 
         assert "__interrupt__" not in result
         final = DocumentState.model_validate(result)
         assert final.status is ProcessingStatus.COMPLETED
         assert final.extraction is None
         assert analysis.extract_calls == []
-        assert len(storage.uploads) == 1
+        assert len(storage.uploads) == 2  # result.json + report.json
 
     def test_reads_the_document_back_from_storage(self, settings: Settings) -> None:
         """The bytes are cleared after classify, so extract re-reads them."""
@@ -356,4 +395,4 @@ class TestReviewerEdits:
         final = DocumentState.model_validate(result)
         assert final.status is ProcessingStatus.REJECTED
         # Still saved, so the rejection is recorded rather than lost.
-        assert len(storage.uploads) == 1
+        assert len(storage.uploads) == 2  # result.json + report.json
