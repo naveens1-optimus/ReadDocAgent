@@ -26,15 +26,12 @@ logger = get_logger(__name__)
 #: small and cheap.
 _TEXT_EXCERPT_LIMIT = 4000
 
-SYSTEM_PROMPT = """\
+# Built from DocumentType so the model is always told about exactly the types
+# the system can route. Adding a type is a one-place change in the enum.
+SYSTEM_PROMPT = f"""\
 You classify business documents. Reply with exactly one document_type from:
 
-- invoice: a request for payment, with an invoice number and totals
-- receipt: proof of a completed purchase, from a merchant
-- contract: an agreement between parties, with clauses and signature blocks
-- resume: a person's CV, listing experience, education and skills
-- id_card: a passport, driving licence or identity card
-- unsupported: anything else
+{DocumentType.as_prompt_list()}
 
 Set confidence to how certain you are, from 0.0 to 1.0. Use a value below 0.5
 when the document is unclear or does not fit any category. Keep reasoning to
@@ -53,8 +50,11 @@ Classify the document from this extracted text:
 class _Verdict(BaseModel):
     """Structured answer requested from the model."""
 
+    # Typed as str, not DocumentType: the model's raw answer is coerced by
+    # DocumentType.from_string, so an unexpected reply degrades to
+    # UNSUPPORTED instead of failing schema validation.
     document_type: str = Field(
-        description="One of: invoice, receipt, contract, resume, id_card, unsupported"
+        description=f"One of: {DocumentType.as_value_list()}"
     )
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(description="One short sentence.")

@@ -109,3 +109,64 @@ class TestHumanReviewRequest:
     def test_rejects_unknown_document_type(self) -> None:
         with pytest.raises(ValidationError):
             HumanReviewRequest(approved=True, document_type="spaceship")
+
+
+class TestTaxonomyIsSingleSourced:
+    """The enum is the only place the taxonomy is defined.
+
+    The classifier prompt, its response schema and the reviewer's options are
+    all generated from DocumentType. These tests fail if a type is added
+    without a description, or if any consumer drifts out of step -- which
+    would otherwise mean telling the model about a type the system cannot
+    route, or vice versa.
+    """
+
+    def test_every_member_has_a_description(self) -> None:
+        for document_type in DocumentType:
+            assert document_type.description.strip(), document_type
+
+    def test_descriptions_are_distinct(self) -> None:
+        descriptions = [d.description for d in DocumentType]
+        assert len(set(descriptions)) == len(descriptions)
+
+    def test_values_helper_matches_the_enum(self) -> None:
+        assert DocumentType.values() == [d.value for d in DocumentType]
+
+    def test_prompt_list_covers_every_member(self) -> None:
+        prompt_list = DocumentType.as_prompt_list()
+        for document_type in DocumentType:
+            assert f"- {document_type.value}:" in prompt_list
+            assert document_type.description in prompt_list
+
+    def test_value_list_covers_every_member(self) -> None:
+        value_list = DocumentType.as_value_list()
+        for document_type in DocumentType:
+            assert document_type.value in value_list
+
+    def test_classifier_prompt_is_generated_from_the_enum(self) -> None:
+        from infrastructure.agents.document_classification_agent import (
+            SYSTEM_PROMPT,
+        )
+
+        for document_type in DocumentType:
+            assert f"- {document_type.value}:" in SYSTEM_PROMPT
+            assert document_type.description in SYSTEM_PROMPT
+
+    def test_response_schema_lists_every_member(self) -> None:
+        from infrastructure.agents.document_classification_agent import _Verdict
+
+        description = _Verdict.model_fields["document_type"].description or ""
+        for document_type in DocumentType:
+            assert document_type.value in description
+
+    def test_every_alias_target_is_a_real_member(self) -> None:
+        """An alias pointing at a removed type would silently become UNSUPPORTED."""
+        from domain.enum.document_type import _ALIASES
+
+        for alias, target in _ALIASES.items():
+            assert DocumentType(target), alias
+
+    def test_aliases_do_not_shadow_canonical_values(self) -> None:
+        from domain.enum.document_type import _ALIASES
+
+        assert not set(_ALIASES) & set(DocumentType.values())

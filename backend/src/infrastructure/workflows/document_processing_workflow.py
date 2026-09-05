@@ -190,7 +190,7 @@ class DocumentProcessingWorkflow:
                 "confidence": classification.confidence,
                 "reasoning": classification.reasoning,
                 "threshold": threshold,
-                "options": [document.value for document in DocumentType],
+                "options": DocumentType.values(),
             }
         )
 
