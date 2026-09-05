@@ -26,6 +26,7 @@ from domain.schema.settings import (
     AppSettings,
     AzureOpenAISettings,
     BlobStorageSettings,
+    CosmosDbSettings,
     DocumentIntelligenceSettings,
     LangSmithSettings,
     RetryPolicySettings,
@@ -54,7 +55,6 @@ def _build_app_settings() -> AppSettings:
         log_format=(get_env("LOG_FORMAT", "text") or "text").lower(),
         confidence_threshold=get_env_float("CONFIDENCE_THRESHOLD", 0.80),
         arithmetic_tolerance=get_env_float("ARITHMETIC_TOLERANCE", 0.01),
-        checkpoint_db_path=get_env("CHECKPOINT_DB_PATH", "./checkpoints.sqlite"),
         max_upload_size_mb=get_env_int("MAX_UPLOAD_SIZE_MB", 20),
     )
 
@@ -91,6 +91,17 @@ def _build_blob_storage_settings() -> BlobStorageSettings:
         connection_string=load_required_env("AZURE_STORAGE_CONNECTION_STRING"),
         input_container=get_env("AZURE_STORAGE_INPUT_CONTAINER", "idp-input"),
         output_container=get_env("AZURE_STORAGE_OUTPUT_CONTAINER", "idp-output"),
+    )
+
+
+def _build_cosmos_db_settings() -> CosmosDbSettings:
+    """Assemble Cosmos DB settings for the checkpointer (key-based auth)."""
+    return CosmosDbSettings(
+        endpoint=load_required_env("AZURE_COSMOS_ENDPOINT"),
+        key=load_required_env("AZURE_COSMOS_KEY"),
+        database_name=get_env("AZURE_COSMOS_DATABASE", "idp_langgraph"),
+        container_name=get_env("AZURE_COSMOS_CONTAINER", "checkpoints"),
+        entity_container=get_env("AZURE_COSMOS_ENTITY_CONTAINER", "entities"),
     )
 
 
@@ -143,6 +154,7 @@ def build_settings(*, load_dotenv_file: bool = True) -> Settings:
         document_intelligence=_build_document_intelligence_settings(),
         azure_openai=_build_azure_openai_settings(),
         blob_storage=_build_blob_storage_settings(),
+        cosmos_db=_build_cosmos_db_settings(),
         langsmith=_build_langsmith_settings(),
         retry=_build_retry_policy_settings(),
     )

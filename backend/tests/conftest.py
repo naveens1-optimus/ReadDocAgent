@@ -27,6 +27,10 @@ APP_ENV_VARS: tuple[str, ...] = (
     "AZURE_STORAGE_CONNECTION_STRING",
     "AZURE_STORAGE_INPUT_CONTAINER",
     "AZURE_STORAGE_OUTPUT_CONTAINER",
+    "AZURE_COSMOS_ENDPOINT",
+    "AZURE_COSMOS_KEY",
+    "AZURE_COSMOS_DATABASE",
+    "AZURE_COSMOS_CONTAINER",
     "LANGSMITH_TRACING",
     "LANGSMITH_API_KEY",
     "LANGSMITH_PROJECT",
@@ -36,7 +40,6 @@ APP_ENV_VARS: tuple[str, ...] = (
     "LOG_FORMAT",
     "CONFIDENCE_THRESHOLD",
     "ARITHMETIC_TOLERANCE",
-    "CHECKPOINT_DB_PATH",
     "MAX_UPLOAD_SIZE_MB",
     "AZURE_MAX_ATTEMPTS",
     "AZURE_RETRY_BASE_DELAY_SECONDS",
@@ -54,6 +57,8 @@ MINIMAL_VALID_ENV: dict[str, str] = {
         "DefaultEndpointsProtocol=https;AccountName=test;"
         "AccountKey=dGVzdC1hY2NvdW50LWtleQ==;EndpointSuffix=core.windows.net"
     ),
+    "AZURE_COSMOS_ENDPOINT": "https://test-cosmos.documents.azure.com:443/",
+    "AZURE_COSMOS_KEY": "test-cosmos-key",
 }
 
 
@@ -85,6 +90,52 @@ def _reset_settings_cache() -> Iterator[None]:
     reset_settings_cache()
     yield
     reset_settings_cache()
+
+
+@pytest.fixture(autouse=True)
+def _ignore_local_dotenv(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Stop the developer's own ``backend/src/.env`` reaching the tests.
+
+    ``build_settings`` calls ``load_env()``, which would read that file and
+    repopulate the very variables ``clean_env`` just removed -- making tests
+    pass or fail depending on whether the local .env happens to be filled in.
+    Neutralising the load here means settings come only from what a test sets.
+    """
+    monkeypatch.setattr(
+        "infrastructure.config.settings.load_env", lambda *args, **kwargs: None
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _offline_checkpointer(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Swap the Cosmos DB checkpointer for an in-memory SQLite one.
+
+    ``CosmosDBSaverSync`` and ``CosmosEntityStore`` both connect in their
+    constructors, so building the services would otherwise make real network
+    calls during app startup. The suite must run offline and fast, and the
+    checkpointer is injected, so substituting it here changes nothing about
+    what the tests actually exercise.
+    """
+    import sqlite3
+
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from tests.fakes import FakeEntityStore
+
+    monkeypatch.setattr(
+        "infrastructure.services.service_registry.build_checkpointer",
+        lambda _settings: SqliteSaver(
+            sqlite3.connect(":memory:", check_same_thread=False)
+        ),
+    )
+    # CosmosEntityStore also connects in its constructor, so it would make a
+    # real network call during app startup.
+    monkeypatch.setattr(
+        "infrastructure.services.service_registry.CosmosEntityStore",
+        lambda *args, **kwargs: FakeEntityStore(),
+    )
+    yield
 
 
 @pytest.fixture

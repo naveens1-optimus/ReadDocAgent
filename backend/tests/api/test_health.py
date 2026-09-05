@@ -48,15 +48,19 @@ class TestLiveness:
         assert client.get("/health").json()["timestamp"]
 
 
+def _component(body: dict, name: str) -> dict:
+    """Pull one named component out of a readiness body."""
+    return next(item for item in body["components"] if item["name"] == name)
+
+
 class TestReadiness:
     def test_ready_when_configured(self, client: TestClient) -> None:
         response = client.get("/health/ready")
         assert response.status_code == 200
         body = response.json()
         assert body["ready"] is True
-        assert body["components"][0]["name"] == "configuration"
-        assert body["components"][0]["ready"] is True
-        assert body["components"][0]["detail"] is None
+        assert _component(body, "configuration")["ready"] is True
+        assert _component(body, "azure_services")["ready"] is True
 
     def test_returns_503_when_unconfigured(
         self, unconfigured_client: TestClient
@@ -69,9 +73,31 @@ class TestReadiness:
         self, unconfigured_client: TestClient
     ) -> None:
         """The probe must be actionable, not just red."""
-        component = unconfigured_client.get("/health/ready").json()["components"][0]
+        component = _component(
+            unconfigured_client.get("/health/ready").json(), "configuration"
+        )
         assert component["ready"] is False
         assert "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT" in component["detail"]
+
+    def test_services_not_built_when_unconfigured(
+        self, unconfigured_client: TestClient
+    ) -> None:
+        component = _component(
+            unconfigured_client.get("/health/ready").json(), "azure_services"
+        )
+        assert component["ready"] is False
+
+    def test_probe_makes_no_azure_calls(self, client: TestClient) -> None:
+        """A probe must stay fast, so it only performs local checks.
+
+        The test credentials point at a host that does not resolve; if the
+        probe called Azure this would hang on DNS and socket timeouts.
+        """
+        import time
+
+        started = time.perf_counter()
+        client.get("/health/ready")
+        assert time.perf_counter() - started < 2.0
 
     def test_reports_version(self, client: TestClient) -> None:
         assert client.get("/health/ready").json()["version"] == __version__
