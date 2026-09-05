@@ -9,6 +9,7 @@ from domain.schema.settings import (
     AppSettings,
     AzureOpenAISettings,
     BlobStorageSettings,
+    CosmosDbSettings,
     DocumentIntelligenceSettings,
     LangSmithSettings,
     RetryPolicySettings,
@@ -233,6 +234,9 @@ class TestSettingsAggregate:
             document_intelligence=_document_intelligence(api_key="di-secret"),
             azure_openai=_azure_openai(api_key="aoai-secret"),
             blob_storage=_blob_storage(connection_string="AccountKey=blob-secret=="),
+            cosmos_db=CosmosDbSettings(
+                endpoint="https://x.documents.azure.com:443/", key="cosmos-secret"
+            ),
             langsmith=LangSmithSettings(
                 tracing_enabled=True, api_key=SecretStr("ls-secret")
             ),
@@ -246,7 +250,8 @@ class TestSettingsAggregate:
         assert "langsmith tracing    : on" in summary
 
     @pytest.mark.parametrize(
-        "secret", ["di-secret", "aoai-secret", "blob-secret", "ls-secret"]
+        "secret",
+        ["di-secret", "aoai-secret", "blob-secret", "ls-secret", "cosmos-secret"],
     )
     def test_summary_leaks_no_credentials(self, secret: str) -> None:
         """The summary is logged at startup, so it must be credential-free."""
